@@ -32,14 +32,18 @@ flowchart LR
 
 | 阶段 | 做什么 | 由谁负责 |
 |---|---|---|
-| S0 规划 | 把题目拆成 1–3 个研究问题、可证伪假设、方法机制、基线、指标与贡献 | 模型（结构化 JSON，校验后入库） |
+| S0 规划 | 把题目拆成 1–3 个研究问题、可证伪假设、方法机制、基线、指标与贡献；规划智能体先回顾经验、检索已有工作，校验后提交 | 规划智能体 + 代码校验 |
 | S1 文献 | 查询规划 → 三源检索 → 去重 → BM25 预排序 → 摘要级相关性筛选 → 一跳引文图扩展 → 元数据核验 → 证据卡（引文必须逐字出自摘要）→ 主题归纳 | 检索/核验：代码；筛选/归纳：模型 |
 | S2 实验 | 复用 openJiuwen `auto_research` 的 ManagerRuntime（仅开启 设计/编码/执行/反思，关闭其网页检索与 NeurIPS 报告模块）；也可导入团队自有实验结果 | openJiuwen 智能体 + 真实执行 |
 | S3 分析 | 逐条目 bootstrap 置信区间、配对 sign-flip 置换检验、方向感知的最优标注；逐条目子集（评估阶段、剔除失败调用、按标志筛选）须**对所有变体同时复现**实验报告值才被采用；天花板/地板效应与平局自动标注；生成表格、图和“允许数字登记表” | 代码（固定随机种子） |
-| S4 写作 | 按依赖顺序（方法→实验→分析→相关工作→引言→结论→摘要）逐节写作；每次调用的上下文由记忆引擎在 token 预算内装配并留存清单 | 模型 + 确定性清洗 |
-| S5 评审 | 三位视角评审（严谨性/新颖与定位/清晰与影响）按 Agentic Reviewer 的 7 个维度打分 + 忠实度审计；发现写入台账，定向修订，重新编译与门禁，分数不降才接受 | 模型评审 + 代码裁决 |
+| S4 写作 | 作者智能体按依赖顺序（方法→实验→分析→相关工作→引言→结论→摘要）通过工具写作，每次编辑后立即检查，编译通过且无阻断与重大问题才能结束；上下文由记忆引擎装配并留存清单 | 作者智能体 + 确定性工具与门禁 |
+| S5 评审 | 三位视角评审（严谨性/新颖与定位/清晰与影响）按 Agentic Reviewer 的 7 个维度打分 + 忠实度审计，均先用只读工具核对数字与证据再提交；发现写入台账，作者智能体逐条修订并回复，重新编译与门禁，分数不降才接受 | 评审智能体 + 代码裁决 |
 | S6 演进 | 从台账提炼写作经验；跨 ≥2 次运行复现且修复被接受并提分才晋升为生效经验；无效则淘汰；导出为 JiuwenSwarm 技能 `evolutions.json` | 模型提炼 + 代码门控 |
 | S7 打包 | 论文 PDF、LaTeX 源码、全部产物的 SHA-256 溯源清单、评审台账、门禁报告、**论断–证据地图** `claims.json`、**环境快照** `environment.json`、运行报告（含各阶段 token 用量） | 代码 |
+
+### 智能体：借鉴 Claude Code 与 Codex
+
+Tyche 的规划、写作与评审默认以智能体会话运行（`tyche/agent/`，`agents.enabled`），工作方式借鉴 Claude Code 与 Codex，只借鉴理念，不复制代码与提示词。模型通过工具循环完成任务：权限模式限定每类智能体能用的工具；智能体自己维护待办清单；每次编辑后宿主立即检查该节；结束前宿主编译全文并运行全部门禁，有问题就退回；事实核查与每位评审在全新上下文中作为子智能体工作；长对话写工作摘要后继续，而不是截断；被拒绝的修订截断回检查点；每个会话留有完整转录。所有工具都是确定性代码，没有任何工具能登记数字、加入参考文献或让门禁通过。`agents.enabled: false` 恢复逐节单次调用。
 
 更详细的设计见 [docs/tyche/DESIGN.md](docs/tyche/DESIGN.md)。
 
@@ -58,9 +62,10 @@ Tyche 既能就三个方向**生成论文**（`--direction context_engineering |
 | 路径 | 内容 |
 |---|---|
 | `tyche/` | 全部自研代码：配置、LLM 封装、工作区与溯源、记忆引擎、文献、实验桥接、统计分析、论文写作与编译、门禁、评审、演进、流水线、CLI、离线自检 |
+| `tyche/agent/` | 智能体运行时（工具协议、权限模式、待办清单、结束前检查、子智能体、上下文压缩、回滚、转录）、论文工作台工具与作者智能体 |
 | `tyche/trace/` | 可追溯层：论断–证据地图、逐轮修订差异、产物谱系、环境快照、打包目录离线核验 `tyche verify`（均由确定性代码计算，不调用模型） |
 | `tyche/web/` | 科研工作台 `tyche ui`：FastAPI 后端（只监听本机、Host/Origin 校验、SSE 实时推送）与 React 前端 |
-| `tests/tyche/` | 251 个离线单元/端到端测试（含真实 LaTeX 编译的完整自检与 Web API 测试） |
+| `tests/tyche/` | 272 个离线单元/端到端测试（含真实 LaTeX 编译的完整自检与 Web API 测试） |
 | `jiuwenswarm/resources/agent/workspace/skills/tyche-iclr-paper/` | SwarmFlow 蜂群技能：按阶段编排，可在 TUI `/swarmflows` 监控，支持人工审批研究计划 |
 | `jiuwenswarm/resources/agent/workspace/skills/tyche-paper/` | Agent 模式技能：在对话中驱动 `tyche` |
 | `scripts/tyche/install_dev.sh` | 开发环境安装；gitcode 不可达时自动改用 GitHub 镜像的**同一提交** |
@@ -198,7 +203,7 @@ tyche ui                       # 打开 http://127.0.0.1:8765 ；--port、--work
 ```bash
 source .venv/bin/activate
 ruff check tyche tests/tyche
-pytest tests/tyche                       # 251 项，含真实 LaTeX 编译的端到端自检
+pytest tests/tyche                       # 272 项，含真实 LaTeX 编译的端到端自检
 tyche selftest
 npm --prefix tyche/web/frontend test     # 前端单元测试（需 Node.js）
 python jiuwenswarm/resources/agent/workspace/skills/swarmskill-creator/scripts/validate_swarmskill.py \
@@ -226,6 +231,12 @@ Language models propose plans, prose, and critiques. Deterministic code handles 
   and papers over the page limit.
 
 Experiments reuse openJiuwen's `auto_research` runtime; alternatively, the team can import its own metrics.
+
+Planning, writing, and review run as agent sessions modelled on coding agents such as Claude Code and Codex
+(concepts only): the model acts through deterministic tools under a permission mode, keeps a todo list, gets each
+edit checked at once, cannot finish while the compiled paper fails a gate, delegates fact checks to subagents with a
+fresh context, and has long histories compacted rather than cut. No tool can register a number, add a reference, or
+pass a gate, so the evidence boundary is unchanged.
 
 A three-lens review panel scores the Stanford Agentic Reviewer's seven dimensions, and a fidelity auditor checks
 claims against the evidence. Their findings drive targeted, acceptance-tested revisions.

@@ -12,6 +12,8 @@ Tyche 基于 openJiuwen agent-core SDK（`openjiuwen`，锁定提交 `9e3390195a
 
 同一个模型对象通过 `OpenJiuwenLLM.openjiuwen_model` 交给实验引擎，因此 openJiuwen 实验智能体与 Tyche 使用相同的模型配置。
 
+Tyche 自己的规划、作者与评审智能体（`tyche/agent/`）同样经由这个模型对象调用模型：智能体的每一轮是一次 `model.invoke`，工具调用写在回复文本中，由 Tyche 在宿主侧解析与执行。实验阶段的设计、编码与执行智能体是 openJiuwen 的 DeepAgent（见第 2 节）。Tyche 的写作与评审智能体没有建在 DeepAgent 上，而是使用自己的轻量运行时，原因有二：一是每个会话保持为一段只追加的对话，服务端提示缓存可以覆盖此前所有轮次；二是工具集合、结束前检查与回滚都要受 Tyche 证据边界的约束。
+
 ## 2. 实验闭环：`openjiuwen.rsi.artifact_rsi.paper_opt.auto_research`
 
 Tyche 不重写实验自动化，而是直接驱动 openJiuwen `auto_research` 的 `ManagerRuntime`。JiuwenSwarm 的 RSI 论文 provider 使用的也是这个运行时。Tyche 只开启其中的科学闭环：

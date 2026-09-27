@@ -17,7 +17,15 @@ Tyche 是 openJiuwen JiuwenSwarm 的 Apache-2.0 fork。openJiuwen agent-core（`
    任何需要复用 openJiuwen 实验能力、但自行撰写论文或报告的应用都可以直接使用这一层。
 4. **与 `agent_evolving` 互通的写作经验演进**（`tyche/evolution/playbook.py`）：评审发现被提炼成写作经验，经过门控后才晋升，并以 `EvolutionLog / EvolutionRecord` 格式导出为技能的 `evolutions.json`。导出时保留 JiuwenSwarm 或人工添加的其他演进记录。
 5. **证据约束的论文生成与离线核验**（`tyche verify`）：参考文献只来自核验过的学术 API，结果数字只来自统计代码。打包目录中的每个数字与引用都可以离线重算和核对，为基于 openJiuwen 的科研智能体提供了可审计的交付格式。
-6. **提示缓存适配与用量计量**（`tyche/cache.py`、`tyche/llm.py`）：
+6. **证据约束的智能体运行时**（`tyche/agent/`）：借鉴 Claude Code 与 Codex 的工作方式，运行在 openJiuwen `init_model` 创建的任意模型上：
+   - 文本工具协议，LaTeX 等长文本参数无需 JSON 转义；
+   - 按工具作用划分的权限模式与 allow / deny / ask 名单；
+   - 智能体维护的待办清单，编辑后检查，以及宿主检查不通过就退回任务的结束前检查；
+   - 全新上下文的子智能体、长对话压缩、截断式回滚与 JSONL 转录；
+   - 每个会话都是只追加的对话，服务端提示缓存覆盖此前所有轮次。
+
+   工具全部是宿主代码，应用只需提供自己的工具与检查。Tyche 用它实现规划、作者与评审智能体。
+7. **提示缓存适配与用量计量**（`tyche/cache.py`、`tyche/llm.py`）：
    - 在 openJiuwen `init_model` 之上按服务类型附加缓存提示；
    - 逐次记录输入、缓存命中与输出 token；
    - 连接中断、超时、429 与 5xx 自动退避重试；

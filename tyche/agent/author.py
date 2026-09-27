@@ -320,9 +320,10 @@ class AgentAuthor:
         )
         task = (
             "Write the complete paper: all seven sections (" + ", ".join(WRITE_ORDER) + ") and its title. "
-            "Your todo list holds a suggested order: substance first, framing last. After the last section, run "
-            "build_paper and fix every blocker and every major finding you can. Finish with a reply without a "
-            "tool call once the checks pass."
+            "Your todo list holds a suggested order: substance first, framing last. Write one section per reply "
+            "and fix what its checks report before the next. After the last section, run build_paper and fix "
+            "every blocker and every major finding you can. Finish with a reply without a tool call once the "
+            "checks pass."
         )
         outcome = await self._run("draft", task)
         missing = desk.missing()

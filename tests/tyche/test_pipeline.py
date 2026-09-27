@@ -159,3 +159,26 @@ def test_resume_keeps_the_run_config_and_rejects_mismatched_reuse(tmp_path, monk
     code = cli.main(["run", "--workspace", str(root), "--run-id", "r1", "--resume-if-exists",
                      "--topic", "topic B", "--direction", "memory_engine"])
     assert code == 2 and "different topic" in capsys.readouterr().err
+
+
+async def test_plan_stage_records_operator_notes(tmp_path):
+    from tyche.config import TycheConfig, load_direction
+    from tyche.llm import ScriptedLLM, UsageMeter
+    from tyche.memory import MemoryStore
+    from tyche.pipeline import Pipeline, Services
+    from tyche.selftest import handlers
+    from tyche.workspace import Workspace
+
+    meter = UsageMeter()
+    services = Services(planner=ScriptedLLM(handlers(), meter=meter), writer=None, reviewer=None, searchers=[],
+                        verifier=None, s2=None, engine=None, meter=meter)
+    for run_id, notes in (("with-notes", "Avoid ceiling effects.\n"), ("without-notes", "")):
+        ws = Workspace.create(tmp_path, run_id, topic="t", direction="memory_engine", config_digest="x")
+        pipe = Pipeline(TycheConfig.load(env={}), ws, services, MemoryStore(tmp_path / "memory.db"),
+                        load_direction("memory_engine"), echo=lambda *a: None, operator_notes=notes)
+        await pipe.stage_plan()
+        if notes:
+            assert ws.latest_path("operator_notes").read_text(encoding="utf-8") == notes
+            assert ws.latest("plan").inputs == [ws.latest("operator_notes").id]
+        else:
+            assert ws.latest("operator_notes") is None and ws.latest("plan").inputs == []

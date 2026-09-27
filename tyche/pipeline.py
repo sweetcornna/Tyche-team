@@ -141,7 +141,13 @@ class Pipeline:
             budget=int(self.cfg.get("memory.context_budgets.plan", 6000)),
             operator_notes=self.operator_notes,
         )
-        rec = self.ws.save_json("plan", plan.model_dump(), stage="plan")
+        # Operator notes steer the plan, so they belong in the run record next to it.
+        inputs = (
+            [self.ws.save_text("operator_notes", self.operator_notes, stage="plan").id]
+            if self.operator_notes.strip()
+            else []
+        )
+        rec = self.ws.save_json("plan", plan.model_dump(), stage="plan", inputs=inputs)
         self.ws.save_text("plan_md", plan_markdown(plan), stage="plan", inputs=[rec.id])
         write_json_atomic(self.ws.stage_dir("plan") / "context_manifest.json", manifest)
         return {"method": plan.method_name, "title": plan.working_title}

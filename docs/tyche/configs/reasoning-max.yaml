@@ -1,0 +1,17 @@
+# Settings for an OpenAI-compatible reasoning model at maximum reasoning effort
+# (used for the gpt-6-luna runs). Merge them over the packaged defaults with
+#
+#   tyche run --config docs/tyche/configs/reasoning-max.yaml --topic ... --direction ...
+#
+# The endpoint, model, and key still come from .env (API_BASE, MODEL_NAME, API_KEY,
+# MODEL_CONTEXT_WINDOW); nothing here is secret.
+models:
+  default:
+    # Sent as the request's reasoning_effort field. Use a level your endpoint accepts
+    # (OpenAI-style: low, medium, high; some gateways add xhigh and max).
+    extra_body: {reasoning_effort: max}
+    # Hidden reasoning counts toward max_tokens; at max effort one section or review can
+    # spend tens of thousands of tokens before the answer, so leave plenty of room.
+    max_tokens: 65536
+    # A max-effort call on a long prompt can take several minutes.
+    timeout: 1800

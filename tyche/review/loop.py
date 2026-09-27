@@ -170,7 +170,15 @@ class RevisionLoop:
             writer = self.composer.writer
             writer_state = writer.checkpoint() if hasattr(writer, "checkpoint") else None
             touched_ids: list[str] = []
-            for section, entries in selected.items():
+            if hasattr(writer, "revise_paper"):
+                # An agent author addresses every selected finding in one task, editing the draft in place.
+                findings = [
+                    {**_as_prompt_finding(e), "section": section} for section, entries in selected.items() for e in entries
+                ]
+                responses = await writer.revise_paper(findings)
+                self.ledger.record_responses(responses, round_no)
+                touched_ids = [f["id"] for f in findings]
+            for section, entries in selected.items() if not hasattr(writer, "revise_paper") else ():
                 draft = await self.composer.writer.revise(
                     section,
                     self.composer.ctx,

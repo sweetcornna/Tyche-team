@@ -32,6 +32,7 @@ import {
   ExperimentsContent,
   PaperCard,
   PlanContent,
+  AgentActivity,
   ReviewContent,
   StageBlock,
   SurveyContent,
@@ -498,7 +499,7 @@ function StageTurn({
   switch (stage.name) {
     case "plan":
       return (
-        <StageBlock stage={stage} details={usage}>
+        <StageBlock stage={stage} details={withAgents(usage, stageEvents)} live={running ? <AgentActivity events={stageEvents} live /> : undefined}>
           {done && <PlanContent detail={detail} onOpen={onOpen} />}
         </StageBlock>
       );
@@ -530,13 +531,22 @@ function StageTurn({
       );
     case "write":
       return (
-        <StageBlock stage={stage} details={usage}>
-          {(done || stageEvents.some((e) => e.kind === "write.section")) && <WriteContent stage={stage} events={stageEvents} />}
+        <StageBlock stage={stage} details={withAgents(usage, stageEvents)} live={running ? <AgentActivity events={stageEvents} live /> : undefined}>
+          {(done || stageEvents.some((e) => e.kind === "write.section" || e.kind === "agent.edit")) && <WriteContent stage={stage} events={stageEvents} />}
         </StageBlock>
       );
     case "review":
       return (
-        <StageBlock stage={stage} details={usage} live={running ? <ReviewLive events={stageEvents} /> : undefined}>
+        <StageBlock
+          stage={stage}
+          details={withAgents(usage, stageEvents)}
+          live={running ? (
+            <div className="space-y-3">
+              <ReviewLive events={stageEvents} />
+              <AgentActivity events={stageEvents} live />
+            </div>
+          ) : undefined}
+        >
           {done && <ReviewContent detail={detail} events={stageEvents} onOpen={onOpen} />}
         </StageBlock>
       );
@@ -572,6 +582,17 @@ function StageTurn({
 }
 
 /** Events that belong to the latest attempt of one stage (between its last stage.running and the next stage). */
+/** A finished stage's details: its agents' activity (when it ran agents) above its model usage. */
+function withAgents(usage: ReactNode, events: RunEvent[]): ReactNode {
+  if (!events.some((e) => e.kind === "agent.tool")) return usage;
+  return (
+    <div className="space-y-4">
+      <AgentActivity events={events} />
+      {usage}
+    </div>
+  );
+}
+
 function eventsForStage(events: RunEvent[], stage: StageName): RunEvent[] {
   let start = -1;
   for (let i = events.length - 1; i >= 0; i--) {

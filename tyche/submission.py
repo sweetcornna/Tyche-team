@@ -61,6 +61,12 @@ TEMPLATES = Path("scripts/tyche/submission")
 
 # Usage purposes grouped into the modules the report lists, most specific prefix first.
 _MODULES = (
+    # Agent sessions (tyche/agent), when agents.enabled; the one-call-per-step purposes follow.
+    ("agent:plan", "规划智能体（回顾经验、检索、校验并提交计划）"),
+    ("agent:author", "作者智能体（撰写、自检、按评审修订、编译修复）"),
+    ("agent:fact_checker", "事实核查子智能体"),
+    ("agent:review:auditor", "忠实度审计（带工具）"),
+    ("agent:review", "评审团（三位评审，带工具）"),
     ("plan", "规划（研究计划）"),
     ("survey", "文献调研（检索式、筛选、证据卡、综述）"),
     ("write", "分节写作与标题"),

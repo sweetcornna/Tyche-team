@@ -430,11 +430,105 @@ export function AnalysisContent({ runId, onOpen }: { runId: string; onOpen: Open
   );
 }
 
+/* ---------- Agent activity: todo list and recent tool calls of the stage's agents ---------- */
+
+type Todo = { id: string; content: string; status: string };
+
+const AGENT_KINDS = new Set(["agent.tool", "agent.stop_blocked", "agent.compact", "agent.delegate", "agent.build", "agent.max_turns"]);
+
+export function AgentActivity({ events, live = false }: { events: RunEvent[]; live?: boolean }) {
+  const { t } = useI18n();
+  const todosEvent = [...events].reverse().find((e) => e.kind === "agent.todos");
+  const todos = (todosEvent?.todos as Todo[] | undefined) ?? [];
+  const calls = events.filter((e) => e.kind === "agent.tool");
+  const failed = calls.filter((e) => !e.ok).length;
+  // A build_paper call is shown by its agent.build result, which carries pages and blockers.
+  const recent = events.filter((e) => AGENT_KINDS.has(e.kind) && !(e.kind === "agent.tool" && e.tool === "build_paper")).slice(-10);
+  if (!calls.length && !todos.length) return null;
+  const done = todos.filter((x) => x.status === "completed").length;
+  return (
+    <div className="space-y-3">
+      {todos.length > 0 && (
+        <div>
+          <div className="mb-1 text-xs font-medium uppercase tracking-wide text-faint">
+            {t("agent.todos")} · {done}/{todos.length}
+          </div>
+          <ul className="space-y-0.5 text-[13.5px]">
+            {todos.map((x) => (
+              <li key={x.id} className="flex items-start gap-2">
+                {x.status === "completed" ? (
+                  <Check className="mt-0.5 h-3.5 w-3.5 shrink-0 text-ok" />
+                ) : x.status === "in_progress" ? (
+                  <Loader2 className={clsx("mt-0.5 h-3.5 w-3.5 shrink-0 text-info", live && "animate-spin")} />
+                ) : (
+                  <Circle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-faint" />
+                )}
+                <span className={clsx(x.status === "completed" && "text-muted", x.status === "cancelled" && "text-faint line-through")}>
+                  {x.content}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {recent.length > 0 && (
+        <div>
+          <div className="mb-1 text-xs font-medium uppercase tracking-wide text-faint">
+            {t("agent.tools", { n: calls.length })}
+            {failed > 0 && <span> · {t("agent.toolErrors", { n: failed })}</span>}
+          </div>
+          <ul className="space-y-0.5 font-mono text-[12.5px] text-muted">
+            {recent.map((e) => (
+              <li key={e.seq} className="flex items-center gap-2">
+                {e.kind === "agent.tool" ? (
+                  <>
+                    {e.ok ? <Check className="h-3 w-3 shrink-0 text-ok" /> : <AlertOctagon className="h-3 w-3 shrink-0 text-bad" />}
+                    <span className="truncate">{String(e.session)} → {String(e.tool)}</span>
+                  </>
+                ) : e.kind === "agent.build" ? (
+                  <>
+                    {e.compiled && !Number(e.blockers) ? <ShieldCheck className="h-3 w-3 shrink-0 text-ok" /> : <ShieldAlert className="h-3 w-3 shrink-0 text-warn" />}
+                    <span className="truncate">{t("agent.build", { pages: Number(e.main_pages), blockers: Number(e.blockers) })}</span>
+                  </>
+                ) : e.kind === "agent.stop_blocked" ? (
+                  <>
+                    <ShieldAlert className="h-3 w-3 shrink-0 text-warn" />
+                    <span className="truncate">{t("agent.blocked", { session: String(e.session) })}</span>
+                  </>
+                ) : e.kind === "agent.delegate" ? (
+                  <>
+                    <ArrowUpRight className="h-3 w-3 shrink-0 text-info" />
+                    <span className="truncate">{t("agent.delegated", { helper: String(e.helper) })}</span>
+                  </>
+                ) : e.kind === "agent.compact" ? (
+                  <>
+                    <FileText className="h-3 w-3 shrink-0 text-info" />
+                    <span className="truncate">{t("agent.compacted", { session: String(e.session) })}</span>
+                  </>
+                ) : (
+                  <>
+                    <PauseCircle className="h-3 w-3 shrink-0 text-warn" />
+                    <span className="truncate">{t("agent.outOfTurns", { session: String(e.session) })}</span>
+                  </>
+                )}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ---------- Writing ---------- */
 
 export function WriteContent({ stage, events }: { stage: StageInfo; events: RunEvent[] }) {
   const { t } = useI18n();
-  const sections = events.filter((e) => e.kind === "write.section");
+  // One-call-per-section writing logs write.section; the author agent logs agent.edit (latest per section).
+  const legacy = events.filter((e) => e.kind === "write.section");
+  const edits = new Map<string, RunEvent>();
+  for (const e of events) if (e.kind === "agent.edit") edits.set(String(e.section), { ...e, kind: "write.section" });
+  const sections = legacy.length ? legacy : [...edits.values()];
   const title = stage.summary.title as string | undefined;
   return (
     <div className="space-y-2">

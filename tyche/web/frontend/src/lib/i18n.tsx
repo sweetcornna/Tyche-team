@@ -205,6 +205,15 @@ const en = {
   "write.sections": "Sections",
   "write.words": "{n} {n|word|words}",
 
+  "agent.todos": "Agent plan",
+  "agent.tools": "{n} tool {n|call|calls}",
+  "agent.toolErrors": "{n} returned an error",
+  "agent.build": "build: {pages} main-text pages, {blockers} {blockers|blocker|blockers}",
+  "agent.blocked": "{session}: host checks failed, task handed back",
+  "agent.delegated": "delegated to {helper}",
+  "agent.compacted": "{session}: context compacted",
+  "agent.outOfTurns": "{session}: out of turns",
+
   "review.rounds": "Review rounds",
   "review.round": "Round {n}",
   "review.accepted": "accepted",
@@ -642,6 +651,15 @@ const zh: Record<MessageKey, string> = {
 
   "write.sections": "章节",
   "write.words": "{n} 词",
+
+  "agent.todos": "智能体待办",
+  "agent.tools": "{n} 次工具调用",
+  "agent.toolErrors": "{n} 次返回错误",
+  "agent.build": "编译：正文 {pages} 页，{blockers} 个阻断项",
+  "agent.blocked": "{session}：主机检查未通过，任务退回",
+  "agent.delegated": "委派给 {helper}",
+  "agent.compacted": "{session}：上下文已压缩",
+  "agent.outOfTurns": "{session}：轮次用尽",
 
   "review.rounds": "评审轮次",
   "review.round": "第 {n} 轮",

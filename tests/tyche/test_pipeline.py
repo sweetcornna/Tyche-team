@@ -28,12 +28,28 @@ async def test_selftest_end_to_end_and_resume(tmp_path):
     assert all(row["status"] == "done" for row in state["stages"].values())
     manifests = list((run_dir / "write" / "context_manifests").glob("*.json"))
     assert manifests and all("budget" in json.loads(m.read_text()) for m in manifests)
+    # Plan, write, and review ran as agent sessions; their transcripts are part of the run record.
+    transcripts = {p.name for p in run_dir.glob("*/agents/transcripts/*.jsonl")}
+    assert {"planner.jsonl", "author.jsonl", "fact_checker_01.jsonl", "round1_rigor.jsonl"} <= transcripts
+    assert (run_dir / "package" / "run_record" / "artifacts" / "agent_transcripts").is_dir()
+    events = [json.loads(line)["kind"] for line in (run_dir / "events.jsonl").read_text().splitlines()]
+    assert {"agent.tool", "agent.todos", "agent.build", "agent.delegate", "agent.stop_blocked"} <= set(events)
     report = (run_dir / "package" / "run_report.md").read_text()
     assert "SYNTHETIC FIXTURE" in report
     provenance = json.loads((run_dir / "package" / "provenance.json").read_text())
     names = {a["name"] for a in provenance["artifacts"]}
     assert {"plan", "refs_bib", "experiment_results", "analysis", "draft", "paper_pdf", "ledger"} <= names
     assert Path(summary["pdf"]).exists()
+
+
+@needs_latex
+async def test_selftest_with_the_one_call_per_section_writer(tmp_path):
+    summary = await run_selftest(root=tmp_path, echo=lambda *a: None, agents=False)
+    assert summary["ok"], summary
+    run_dir = tmp_path / "runs" / "selftest"
+    assert not (run_dir / "write" / "agents").exists()
+    manifests = list((run_dir / "write" / "context_manifests").glob("*.json"))
+    assert len(manifests) >= 7 and all("budget" in json.loads(m.read_text()) for m in manifests)
 
 
 @needs_latex

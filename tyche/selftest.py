@@ -203,6 +203,127 @@ def _latex(body: str, responses: list[dict[str, Any]] | None = None) -> str:
     return out
 
 
+def _call(tool: str, **args: Any) -> str:
+    """One tool call in the agent protocol (tyche.agent.tools)."""
+    body = "".join(
+        f'<arg name="{k}">\n{v if isinstance(v, str) else json.dumps(v)}\n</arg>\n' for k, v in args.items()
+    )
+    return f'<call tool="{tool}">\n{body}</call>'
+
+
+def _tool_results(message: str) -> dict[str, str]:
+    """Tool results in a message, by tool name (the last result of each tool)."""
+    return {m.group(1): m.group(2) for m in re.finditer(
+        r'<result call="\d+" tool="([\w:-]+)" status="\w+">\n(.*?)\n</result>', message, re.S)}
+
+
+def _task_start(history: list[dict[str, str]], user: str) -> int:
+    """Index in ``history`` of the user turn that set the current task (len(history) if it is ``user``)."""
+    markers = ("Write the complete paper", "<findings_to_address>", "fails to compile", "exceeds its page limit",
+               "are still not written", "was compacted")
+    if any(m in user for m in markers):
+        return len(history)
+    for i in range(len(history) - 1, -1, -1):
+        if history[i]["role"] == "user" and any(m in history[i]["content"] for m in markers):
+            return i
+    return 0
+
+
+def agent_handlers(state: dict[str, Any], review) -> dict[str, Any]:
+    """Scripted agents: they call the same tools, in the same protocol, that real models are given."""
+    from tyche.paper.writer import WRITE_ORDER
+
+    def planner(system: str, user: str, history: list[dict[str, str]]) -> str:
+        if not history:
+            return "Checking lessons and prior work first.\n" + "\n".join([
+                _call("recall_lessons", query="agent memory corrections"),
+                _call("search_literature", query="agent memory provenance"),
+                _call("check_plan", plan=PLAN),
+            ])
+        return _call("submit_plan", plan=PLAN)
+
+    def author(system: str, user: str, history: list[dict[str, str]]) -> str:
+        start = _task_start(history, user)
+        task = user if start == len(history) else history[start]["content"]
+        done_turns = [t["content"] for t in history[start:] if t["role"] == "assistant"]
+        if "<findings_to_address>" in task:
+            findings = _json_block(task, "findings_to_address") or []
+            if not done_turns:
+                sections = sorted({f.get("section", "analysis") for f in findings})
+                return "\n".join(_call("read_section", section=name) for name in sections)
+            if len(done_turns) == 1:
+                current = _tool_results(user).get("read_section", "")
+                anchor = current.strip().splitlines()[-1] if current.strip() else ""
+                addition = " We state explicitly that this pattern is descriptive and was not tested separately."
+                section = findings[0].get("section", "analysis") if findings else "analysis"
+                calls = [_call("edit_section", section=section, old=anchor, new=anchor + addition)] if anchor else []
+                calls += [_call("respond_to_finding", id=f["id"], action="fixed", note="narrowed the claim")
+                          for f in findings]
+                return "\n".join(calls + [_call("build_paper")])
+            return "Addressed every finding; the build passes."
+        short = re.search(r"structure/(\w+): \d+ words; contract minimum", user) if "<host_checks>" in user else None
+        if short:
+            # The host refused to finish: a section is below its contract. Lengthen it and stop again.
+            name = short.group(1)
+            return _call("write_section", section=name,
+                         latex=_section(name, system + "\n" + user) + "\n\n" + WORDS["filler"] * 4)
+        if "Write the complete paper" in task or "are still not written" in task:
+            written = set(re.findall(r'<call tool="write_section">\n<arg name="section">\n(\w+)', "".join(done_turns)))
+            todo = [name for name in WRITE_ORDER if name not in written]
+            if todo:
+                name = todo[0]
+                calls = [
+                    _call("update_todos", todos=[
+                        {"id": n, "content": f"Write the {n.replace('_', ' ')} section.",
+                         "status": "completed" if n in written else "in_progress" if n == name else "pending"}
+                        for n in WRITE_ORDER
+                    ]),
+                    _call("write_section", section=name, latex=_section(name, system + "\n" + user)),
+                ]
+                if name == "experiments":
+                    calls.append(_call("delegate", agent="fact_checker",
+                                       task="Check the experiments section against the results and the design."))
+                return "\n".join(calls)
+            if not any('<call tool="build_paper"' in t for t in done_turns):
+                return "\n".join([
+                    _call("update_todos", todos=[
+                        {"id": n, "content": f"Write the {n.replace('_', ' ')} section.", "status": "completed"}
+                        for n in WRITE_ORDER
+                    ]),
+                    _call("set_title", title="Selftest Fixture: Provenance-Tagged Memory Ledgers for LLM Agents"),
+                    _call("build_paper"),
+                ])
+            return "The paper is written and its checks pass."
+        # Repair and shorten tasks: the fixture's sections already compile and fit.
+        return "Nothing needs to change."
+
+    def fact_checker(system: str, user: str, history: list[dict[str, str]]) -> str:
+        if not history:
+            return _call("lookup_numbers", query="proposed accuracy")
+        return "All checked claims match the computed results."
+
+    def reviewer(system: str, user: str, history: list[dict[str, str]]) -> str:
+        task = history[0]["content"] if history else user
+        if not history:
+            return _call("lookup_numbers", query="accuracy")
+        return _call("submit", report=json.loads(review(system, task)))
+
+    def auditor(system: str, user: str) -> str:
+        return _call("submit", report={"findings": []})
+
+    def compact(system: str, user: str, history: list[dict[str, str]]) -> str:
+        return "Summary: the task is in progress; continue with the next unwritten section."
+
+    return {
+        "agent:plan": planner,
+        "agent:author:compact": compact,
+        "agent:author": author,
+        "agent:fact_checker": fact_checker,
+        "agent:review:auditor": auditor,
+        "agent:review": reviewer,
+    }
+
+
 def handlers() -> dict[str, Any]:
     state = {"reviews": 0}
 
@@ -314,6 +435,7 @@ def handlers() -> dict[str, Any]:
         )
 
     return {
+        **agent_handlers(state, review),
         "plan": plan,
         "survey:queries": queries,
         "survey:screen": screen,
@@ -331,9 +453,13 @@ def handlers() -> dict[str, Any]:
 
 
 async def run_selftest(
-    keep: Path | None = None, echo=print, root: Path | None = None, run_id: str = "selftest"
+    keep: Path | None = None, echo=print, root: Path | None = None, run_id: str = "selftest", agents: bool = True
 ) -> dict[str, Any]:
-    """Run the selftest in ``root`` (kept) or in a temporary directory (removed afterwards)."""
+    """Run the selftest in ``root`` (kept) or in a temporary directory (removed afterwards).
+
+    With ``agents`` (the default configuration), plan, write, and review run as agent sessions whose
+    scripted models call the real tools; without, as one call per section and per reviewer.
+    """
     from tyche.paper.latex import latex_available
 
     missing = [tool for tool, path in latex_available().items() if path is None]
@@ -348,6 +474,7 @@ async def run_selftest(
                 "experiments.engine=fixture",
                 "review.max_rounds=2",
                 "literature.min_papers=4",
+                f"agents.enabled={'true' if agents else 'false'}",
             ],
             env={},
         )

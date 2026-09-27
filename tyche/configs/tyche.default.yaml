@@ -144,6 +144,31 @@ review:
   max_findings_per_revision: 8
   auditor: true
 
+# Tyche's own agents (plan, write, review) work the way coding agents such as Claude
+# Code and Codex do: a model acting through tools in a loop, with a todo list,
+# permission modes, host checks before it may finish, subagents with a fresh
+# context, and compaction of long histories. Every tool is deterministic host
+# code, so the evidence boundary is unchanged. enabled: false restores the
+# one-call-per-section writer and single-shot reviewers.
+agents:
+  enabled: true
+  # The author's mode: read_only | workspace_write | full. It edits the paper in
+  # the run's workspace. Reviewers, helpers, and the planner are read_only; the
+  # planner is also allowed its literature search (unless denied below).
+  permission_mode: workspace_write
+  # Tool names no agent may call, e.g. [delegate] to turn off helper agents.
+  deny_tools: []
+  # Model turns per task before the host takes the task back.
+  max_turns: {draft: 60, revise: 30, repair: 8, shorten: 10, review: 6, helper: 8, plan: 12}
+  # How often a task may be handed back because the host's checks still fail.
+  max_stop_blocks: 3
+  # Compact a session's history at this share of the model's context window.
+  compact_at: 0.6
+  subagents: true
+  reviewer_tools: true
+  planner_tools: true
+  planner_searches: 4
+
 memory:
   context_budgets:
     plan: 6000

@@ -96,6 +96,8 @@ def test_usage_purposes_map_to_report_modules():
     assert module_of("review:rigor") == "评审团（三位评审）"
     assert module_of("write:title") == module_of("write:method")
     assert module_of("custom:thing") == "custom"
+    assert module_of("agent:author:turn") == module_of("agent:author:compact") != module_of("write:method")
+    assert module_of("agent:review:auditor:turn") != module_of("agent:review:rigor:turn")
 
 
 def test_scan_refuses_credentials_and_reports_endpoint_mentions(tmp_path):

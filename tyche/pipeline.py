@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from tyche import STAGES, __version__
+from tyche.agent import AgentAuthor, AgentSettings, Materials, PaperDesk
 from tyche.analysis import analyze, build_registry, comparison_table, results_brief, results_figure, results_table
 from tyche.analysis.registry import NumberRegistry
 from tyche.config import TycheConfig
@@ -30,7 +31,7 @@ from tyche.paper.compose import PaperComposer
 from tyche.paper.latex import compile_pdf
 from tyche.paper.statements import ai_use_statement, reproducibility_statement
 from tyche.paper.writer import SectionWriter, WritingContext
-from tyche.planning import ResearchPlan, make_plan, plan_markdown
+from tyche.planning import PlannerAgent, ResearchPlan, make_plan, plan_markdown
 from tyche.review import FindingsLedger, ReviewPanel, RevisionLoop
 from tyche.textutil import sanitize_untrusted, truncate_tokens
 from tyche.trace import capture_environment, claim_map_for_run
@@ -87,6 +88,22 @@ class Pipeline:
     def plan(self) -> ResearchPlan:
         return ResearchPlan.model_validate(self.ws.load_json("plan"))
 
+    @property
+    def agents(self) -> AgentSettings:
+        return AgentSettings.from_config(self.cfg.get("agents") or {"enabled": False})
+
+    def _agents_dir(self, stage: str, *, clear: bool = False) -> Path:
+        path = self.ws.stage_dir(stage) / "agents"
+        if clear:
+            shutil.rmtree(path, ignore_errors=True)
+        return path
+
+    def _save_transcripts(self, stage: str, inputs: list[str]) -> None:
+        """Keep the agents' transcripts of a stage in the run record (their builds are scratch)."""
+        transcripts = self._agents_dir(stage) / "transcripts"
+        if transcripts.is_dir() and any(transcripts.iterdir()):
+            self.ws.save_tree("agent_transcripts", transcripts, stage=stage, inputs=inputs)
+
     async def run(self, *, stop_after: str | None = None, only: str | None = None) -> dict[str, Any]:
         if stop_after and stop_after not in STAGES:
             raise StageError(f"unknown stage {stop_after!r}")
@@ -135,6 +152,16 @@ class Pipeline:
     # -- S0 plan -------------------------------------------------------
     async def stage_plan(self) -> dict[str, Any]:
         self.memory.retire_run_items(self.run_id, ["plan"])
+        agents = self.agents
+        planner = None
+        if agents.enabled and agents.planner_tools:
+            planner = PlannerAgent(
+                agents,
+                searchers=list(self.svc.searchers),
+                max_variants=int(self.cfg.get("experiments.max_variants", 4)),
+                transcript=self._agents_dir("plan", clear=True) / "transcripts" / "planner.jsonl",
+                log=self.log,
+            )
         plan, manifest = await make_plan(
             self.svc.planner,
             topic=self.ws.state["topic"],
@@ -143,6 +170,7 @@ class Pipeline:
             run_id=self.run_id,
             budget=int(self.cfg.get("memory.context_budgets.plan", 6000)),
             operator_notes=self.operator_notes,
+            agent=planner,
         )
         # Operator notes steer the plan, so they belong in the run record next to it.
         inputs = (
@@ -153,6 +181,8 @@ class Pipeline:
         rec = self.ws.save_json("plan", plan.model_dump(), stage="plan", inputs=inputs)
         self.ws.save_text("plan_md", plan_markdown(plan), stage="plan", inputs=[rec.id])
         write_json_atomic(self.ws.stage_dir("plan") / "context_manifest.json", manifest)
+        if planner is not None:
+            self._save_transcripts("plan", [rec.id])
         return {"method": plan.method_name, "title": plan.working_title}
 
     # -- S1 survey -----------------------------------------------------
@@ -406,16 +436,35 @@ class Pipeline:
         # The author conversation (system prompt and history) must leave room for one more
         # turn of up to ``budget`` tokens, instructions, and the reply.
         history = spec.context_window - (spec.max_tokens or 8192) - budget - 4000
-        writer = SectionWriter(
-            self.svc.writer,
-            memory=self.memory,
-            contracts=contracts,
-            budget=budget,
-            max_history_tokens=max(16000, history),
-            evidence_limit=int(self.cfg.get("memory.evidence_per_section", 12)),
-            lessons_limit=int(self.cfg.get("memory.lessons_per_section", 5)),
-            manifest_dir=self.ws.stage_dir(stage) / "context_manifests",
-        )
+        agents = self.agents
+        writer: SectionWriter | AgentAuthor
+        if agents.enabled:
+            writer = AgentAuthor(
+                self.svc.writer,
+                memory=self.memory,
+                contracts=contracts,
+                settings=agents,
+                work_dir=self._agents_dir(stage),
+                # Room for the history: the window less one reply and a margin for the next message.
+                context_tokens=max(32000, spec.context_window - (spec.max_tokens or 8192) - 4000),
+                evidence_limit=int(self.cfg.get("memory.evidence_per_section", 12)),
+                lessons_limit=int(self.cfg.get("memory.lessons_per_section", 5)) + 3,
+                materials=Materials(self._design_text(), self._reflection_text()),
+                helper_llm=self.svc.reviewer,
+                manifest_dir=self.ws.stage_dir(stage) / "context_manifests",
+                log=self.log,
+            )
+        else:
+            writer = SectionWriter(
+                self.svc.writer,
+                memory=self.memory,
+                contracts=contracts,
+                budget=budget,
+                max_history_tokens=max(16000, history),
+                evidence_limit=int(self.cfg.get("memory.evidence_per_section", 12)),
+                lessons_limit=int(self.cfg.get("memory.lessons_per_section", 5)),
+                manifest_dir=self.ws.stage_dir(stage) / "context_manifests",
+            )
         figure = self.ws.latest_path("fig_results") if self.ws.latest("fig_results") else None
         floats = self.ws.latest_path("table_main").read_text(encoding="utf-8")
         if figure is not None:
@@ -462,6 +511,7 @@ class Pipeline:
     # -- S4 write --------------------------------------------------------
     async def stage_write(self) -> dict[str, Any]:
         shutil.rmtree(self.ws.stage_dir("write") / "context_manifests", ignore_errors=True)
+        self._agents_dir("write", clear=True)
         ctx, _ = self._writing_context()
         composer = self._composer(ctx, "write")
         await composer.draft()
@@ -477,11 +527,13 @@ class Pipeline:
         state = composer.writer.export_state()
         if state is not None:
             self.ws.save_json("author_conversation", state, stage="write", inputs=inputs)
+        self._save_transcripts("write", inputs)
         return {"title": composer.title, "words": sum(len(s.split()) for s in composer.sections.values())}
 
     # -- S5 review -------------------------------------------------------
     async def stage_review(self) -> dict[str, Any]:
         shutil.rmtree(self.ws.stage_dir("review") / "context_manifests", ignore_errors=True)
+        agents_dir = self._agents_dir("review", clear=True)
         ctx, manifest = self._writing_context()
         composer = self._composer(ctx, "review")
         draft = self.ws.load_json("draft")
@@ -491,12 +543,23 @@ class Pipeline:
             resumed = composer.writer.import_state(self.ws.load_json("author_conversation"), ctx)
             self.log("review.author_conversation", resumed=resumed)
         review_cfg = dict(self.cfg.get("review") or {})
+        agents = self.agents
+        reviewer_tools = None
+        if agents.enabled and agents.reviewer_tools:
+            # Reviewers read the draft under review (the composer's current sections) but never edit it.
+            reader = PaperDesk(composer, self.memory, self.run_id, agents_dir / "reader_builds",
+                               Materials(self._design_text(), self._reflection_text()))
+            reviewer_tools = [t for t in reader.read_tools() if t.name != "paper_status" and t.name != "lint"]
         panel = ReviewPanel(
             self.svc.reviewer,
             reviewers=list(review_cfg.get("reviewers") or ["rigor", "positioning", "clarity"]),
             samples=int(review_cfg.get("samples_per_reviewer", 1)),
             budget=int(self.cfg.get("memory.context_budgets.review", 24000)),
             auditor=bool(review_cfg.get("auditor", True)),
+            tools=reviewer_tools,
+            agent_settings=agents,
+            transcripts=agents_dir / "transcripts",
+            log=self.log,
         )
         ledger = FindingsLedger(reflag_cap=int(review_cfg.get("reflag_cap", 2)))
         uncited = self._uncited_related(manifest, ctx)
@@ -555,6 +618,7 @@ class Pipeline:
         )
         if result.best_review is not None:
             self.ws.save_json("review_scores", result.best_review.to_dict(), stage="review", inputs=inputs)
+        self._save_transcripts("review", inputs)
         injected = self._injected_lesson_ids()
         self.ws.set_meta(injected_lessons=sorted(injected))
         return {

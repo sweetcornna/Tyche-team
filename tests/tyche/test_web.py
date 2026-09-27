@@ -832,7 +832,7 @@ def test_remote_binding_requires_the_launch_token(tmp_path):
     with pytest.raises(ValueError):
         create_app(tmp_path, static_dir=_MISSING_STATIC, host="0.0.0.0")
     app = create_app(tmp_path, static_dir=_MISSING_STATIC, launcher=FakeLauncher(), host="0.0.0.0", token="tok-123")
-    client = TestClient(app, base_url="http://192.168.5.20:8765")
+    client = TestClient(app, base_url="http://192.0.2.20:8765")
     assert client.get("/api/meta").status_code == 401
     assert client.get("/api/meta", params={"token": "wrong"}).status_code == 401
     hop = client.get("/", params={"token": "tok-123"}, follow_redirects=False)
@@ -840,7 +840,7 @@ def test_remote_binding_requires_the_launch_token(tmp_path):
     cookie = hop.headers["set-cookie"].lower()
     assert "httponly" in cookie and "samesite=strict" in cookie
     assert client.get("/api/meta").status_code == 200  # the cookie now authorizes the session
-    other = TestClient(app, base_url="http://192.168.5.20:8765")
+    other = TestClient(app, base_url="http://192.0.2.20:8765")
     assert other.get("/api/meta", headers={"Authorization": "Bearer tok-123"}).status_code == 200
     cross = client.post(
         "/api/runs", json={"topic": "A topic", "direction": "memory_engine"}, headers={"Origin": "http://evil.test"}

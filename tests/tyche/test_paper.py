@@ -408,3 +408,27 @@ def test_main_pages_ignore_review_line_numbers_and_headers():
     # When the statement starts mid-page, that page still holds main text.
     assert main_pages_of([body, body + "AI USE STATEMENT\nText.\n"]) == 2
     assert main_pages_of([body, body]) == 2
+
+
+async def test_revisions_restate_the_section_requirements(memory, tmp_path):
+    from tyche.llm import ScriptedLLM
+    from tyche.paper.writer import SectionWriter, WritingContext
+    from tyche.planning import ResearchPlan
+    from tyche.selftest import PLAN
+
+    ctx = WritingContext(
+        plan=ResearchPlan.model_validate(PLAN), citations=[], synthesis={}, results_brief="- accuracy 0.70",
+        design_excerpt="design", labels={}, run_id="r1",
+    )
+    reply = {k: (lambda s, u: "<latex>Text. \\paragraph{Limitations.} Small n.</latex>") for k in ("write", "revise", "shorten")}
+    llm = ScriptedLLM(reply)
+    writer = SectionWriter(
+        llm, memory=memory, contracts={}, budget=9000, evidence_limit=4, lessons_limit=2,
+        manifest_dir=tmp_path / "manifests",
+    )
+    draft = (await writer.write("analysis", ctx, {})).latex
+    await writer.revise("analysis", ctx, {}, draft, [{"id": "F1", "problem": "p", "fix": "f"}])
+    # The contract was sent with the first draft only; the revision turn restates its requirements.
+    assert "<section_contract>" not in llm.calls[-1][2] and "\\paragraph{Limitations.}" in llm.calls[-1][2]
+    await writer.shorten("analysis", ctx, draft, 150)
+    assert "\\paragraph{Limitations.}" in llm.calls[-1][2]

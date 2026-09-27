@@ -356,6 +356,12 @@ class SectionWriter:
         self._introduced.add(name)
         return SectionDraft(name=name, latex=body, report=report, words=word_count(body), responses=responses)
 
+    def _keep_note(self, name: str, ctx: WritingContext) -> str:
+        """The section contract's requirements, restated: the contract is sent once per conversation,
+        and a revision many turns later must not drop what the gates check (e.g. the Limitations paragraph)."""
+        requirements = self.contract(name, ctx)["requirements"]
+        return " The result must still meet the section requirements: " + " ".join(requirements) if requirements else ""
+
     def _current_note(self, name: str, current: str) -> str:
         if self._latest.get(name) == current:
             return f" The current text of the {name.replace('_', ' ')} section is your latest version of it above."
@@ -374,7 +380,7 @@ class SectionWriter:
         instruction = (
             f"Revise the {name.replace('_', ' ')} section to address every finding in <findings_to_address>. "
             "Change only what the findings require; keep correct content, citations, and numbers intact, and do "
-            "not over-correct. Return the full revised section." + self._current_note(name, current)
+            "not over-correct. Return the full revised section." + self._keep_note(name, ctx) + self._current_note(name, current)
         )
         return await self._call(name, "revise", ctx, blocks, allowed, instruction)
 
@@ -385,7 +391,7 @@ class SectionWriter:
             f"The paper exceeds its page limit. Shorten the {name.replace('_', ' ')} section to at most "
             f"{target_words} words. Remove repetition and secondary detail first; keep every citation that "
             "supports a claim, every reported number that remains, and all \\ref labels. Return the full "
-            "shortened section." + self._current_note(name, current)
+            "shortened section." + self._keep_note(name, ctx) + self._current_note(name, current)
         )
         return await self._call(name, "shorten", ctx, blocks, allowed, instruction)
 

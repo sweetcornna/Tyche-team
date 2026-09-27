@@ -19,7 +19,8 @@ for (const dir of paths) {
   const key = `${pkg.name}@${pkg.version}`;
   if (seen.has(key)) continue;
   const licenseFile = readdirSync(dir).find((name) => /^(licen[cs]e|copying|notice)(\.|$)/i.test(name));
-  const text = licenseFile ? readFileSync(join(dir, licenseFile), "utf8").trim() : "";
+  const raw = licenseFile ? readFileSync(join(dir, licenseFile), "utf8") : "";
+  const text = raw.replace(/\r\n?/g, "\n").replace(/[ \t]+$/gm, "").trim();
   const license = typeof pkg.license === "string" ? pkg.license : JSON.stringify(pkg.license ?? pkg.licenses ?? "UNKNOWN");
   seen.set(key, { key, license, where: relative(root, dir), text });
 }

@@ -1,0 +1,2 @@
+# Built output: minified bundles and verbatim license texts keep their own whitespace.
+dist/** -whitespace linguist-generated=true

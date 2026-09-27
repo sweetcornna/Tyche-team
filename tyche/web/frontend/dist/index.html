@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#f9f9f9" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#181818" media="(prefers-color-scheme: dark)" />
+    <meta name="description" content="Tyche — evidence-bound research agent for ICLR short papers." />
+    <link rel="icon" type="image/svg+xml" href="/tyche.svg" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <title>Tyche</title>
+    <script>
+      // Apply the saved theme before first paint to avoid a light/dark flash.
+      (function () {
+        try {
+          var t = localStorage.getItem("tyche.theme") || "system";
+          var dark = t === "dark" || (t === "system" && matchMedia("(prefers-color-scheme: dark)").matches);
+          document.documentElement.classList.toggle("dark", dark);
+        } catch (e) {}
+      })();
+    </script>
+    <script type="module" crossorigin src="/assets/index-BccloBYy.js"></script>
+    <link rel="modulepreload" crossorigin href="/assets/react-B9qbo_Zs.js">
+    <link rel="modulepreload" crossorigin href="/assets/radix-jBoNgxw4.js">
+    <link rel="stylesheet" crossorigin href="/assets/index-CSJ40te3.css">
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>

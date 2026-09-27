@@ -56,7 +56,7 @@
 - 预算：回合数与重试次数更紧。
 - 模型：生成的实验代码通过环境变量 `API_KEY / API_BASE / MODEL_NAME` 调用同一模型。
 
-收集的产物包括各变体的 `results/*.metrics.json`、实验设计文档、生成代码与反思记录。
+收集的产物包括各变体的 `results/*.metrics.json`、实验设计文档、生成代码与反思记录。openJiuwen 的 ObservabilityRail 为实验智能体的每次模型调用写下 `agent_trace.jsonl`，Tyche 把本次尝试的轨迹存为 `experiment_traces`，并按模块汇总调用次数、输入、缓存命中与输出 token，存为 `experiment_usage`。无论尝试成功与否都会保存，失败的尝试同样消耗了 token。运行报告与资源报告据此统计实验阶段的用量，同一尝试续跑后只计最新一份，不重复累加。
 
 替代引擎：
 

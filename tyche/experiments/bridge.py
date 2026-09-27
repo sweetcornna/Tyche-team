@@ -28,7 +28,7 @@ import shutil
 from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
-from typing import Any, Collection, Iterator, Protocol
+from typing import Any, Collection, Iterable, Iterator, Protocol
 
 import yaml
 
@@ -92,6 +92,8 @@ class ExperimentOutcome:
     reflections: list[Path] = field(default_factory=list)
     notes: str = ""
     synthetic: bool = False
+    # The openjiuwen manager attempt this run drove; its agent traces record the agents' usage.
+    attempt_dir: Path | None = None
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -357,6 +359,74 @@ def code_implementation_agent(config: dict[str, Any], model: Any, max_iterations
     return TycheCodeImplementationAgent(config, model=model)
 
 
+# openjiuwen's ObservabilityRail writes one JSONL trace per module attempt, with a
+# ``model_call_end`` event (and the provider's usage) for every model call its agents make.
+_TRACE_GLOB = "modules/*/*/agent_trace.jsonl"
+
+
+def _int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def openjiuwen_usage(attempt_dir: Path) -> dict[str, Any]:
+    """Model calls and tokens of openjiuwen's experiment agents in one manager attempt, by module.
+
+    Read from the agent traces openjiuwen writes itself; Tyche's own calls are metered separately
+    (usage.jsonl). Calls whose trace carries no usage are counted as such, never estimated.
+    """
+    from tyche.workspace import read_jsonl
+
+    modules: dict[str, dict[str, int]] = {}
+    for path in sorted(attempt_dir.glob(_TRACE_GLOB)):
+        entry = modules.setdefault(
+            path.parent.parent.name,
+            {"calls": 0, "calls_without_usage": 0, "failed_calls": 0, "input_tokens": 0, "cached_tokens": 0, "output_tokens": 0},
+        )
+        for row in read_jsonl(path):
+            event = row.get("event")
+            if event == "model_call_error":
+                entry["failed_calls"] += 1
+            if event != "model_call_end":
+                continue
+            entry["calls"] += 1
+            usage = row.get("usage") or {}
+            if not usage:
+                entry["calls_without_usage"] += 1
+                continue
+            entry["input_tokens"] += _int(usage.get("input_tokens", usage.get("prompt_tokens")))
+            entry["output_tokens"] += _int(usage.get("output_tokens", usage.get("completion_tokens")))
+            entry["cached_tokens"] += _int(usage.get("cache_read_tokens", usage.get("prompt_cache_hit_tokens")))
+    return {"attempt": attempt_dir.name, "modules": modules}
+
+
+def agent_usage_totals(usages: Iterable[dict[str, Any]]) -> dict[str, int]:
+    """Totals over attempts, keeping only the last record of each attempt (a resumed attempt's
+    traces keep growing, so its earlier records are subsets and must not be added again)."""
+    latest = {str(u["attempt"]): u for u in usages if isinstance(u, dict) and u.get("attempt")}
+    totals = {"attempts": len(latest), "calls": 0, "calls_without_usage": 0, "failed_calls": 0,
+              "input_tokens": 0, "cached_tokens": 0, "output_tokens": 0}
+    for usage in latest.values():
+        for entry in (usage.get("modules") or {}).values():
+            for key in totals:
+                if key != "attempts":
+                    totals[key] += _int(entry.get(key))
+    return totals
+
+
+def collect_agent_traces(attempt_dir: Path, target: Path) -> int:
+    """Copy an attempt's agent traces to ``target/<attempt>/`` (same relative paths); returns the count."""
+    count = 0
+    for path in sorted(attempt_dir.glob(_TRACE_GLOB)):
+        dest = target / attempt_dir.name / path.relative_to(attempt_dir)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, dest)
+        count += 1
+    return count
+
+
 class OpenJiuwenEngine:
     name = "openjiuwen"
 
@@ -438,6 +508,7 @@ class OpenJiuwenEngine:
             notes=f"manager run {manager_run_id}: terminal status={getattr(terminal, 'status', '?')} "
             f"reason={getattr(terminal, 'failure_reason', '') or getattr(terminal, 'abort_reason', '')}"
             + (f"; ignored stale variants: {', '.join(stale)}" if stale else ""),
+            attempt_dir=arw.workspace_dir(manager_run_id),
         )
 
 

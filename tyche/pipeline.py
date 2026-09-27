@@ -185,6 +185,8 @@ class Pipeline:
             plan, summary_path=self.ws.latest_path("research_summary"), work_dir=work, run_id=self.run_id
         )
         self.ws.save_json("experiments", outcome.summary(), stage="experiments")
+        if outcome.attempt_dir is not None and outcome.attempt_dir.is_dir():
+            self._save_agent_usage(outcome.attempt_dir, work)
         if outcome.status != "completed" or len(outcome.variants) < 2:
             raise StageError(
                 f"experiments did not complete ({outcome.engine}): {outcome.notes}. No paper is written without "
@@ -202,6 +204,29 @@ class Pipeline:
             self.ws.save_file("reflection", path, stage="experiments", inputs=inputs)
         self.ws.set_meta(experiment_engine=outcome.engine, synthetic=outcome.synthetic)
         return {"engine": outcome.engine, "variants": sorted(outcome.variants), "synthetic": outcome.synthetic}
+
+    def _save_agent_usage(self, attempt_dir: Path, work: Path) -> None:
+        """Keep the openjiuwen agents' traces of this attempt, and their model usage, in the run record.
+
+        Saved whether or not the attempt succeeded: a failed attempt consumed tokens too.
+        """
+        from tyche.experiments.bridge import collect_agent_traces, openjiuwen_usage
+
+        staging = work / "agent_traces"
+        shutil.rmtree(staging, ignore_errors=True)
+        if collect_agent_traces(attempt_dir, staging):
+            traces = self.ws.save_tree("experiment_traces", staging, stage="experiments")
+            usage = openjiuwen_usage(staging / attempt_dir.name)
+            self.ws.save_json("experiment_usage", usage, stage="experiments", inputs=[traces.id])
+
+    def agent_usage(self) -> dict[str, int] | None:
+        """Model usage of openjiuwen's experiment agents over every attempt this run recorded."""
+        from tyche.experiments.bridge import agent_usage_totals
+
+        records = sorted((r for r in self.ws.records() if r.name == "experiment_usage"), key=lambda r: r.version)
+        if not records:
+            return None
+        return agent_usage_totals(json.loads((self.ws.run_dir / r.path).read_text(encoding="utf-8")) for r in records)
 
     def _check_failed_items(self, variants: dict[str, dict[str, Any]]) -> None:
         """Stop when too many items failed to run: their scores would measure failures, not methods."""
@@ -775,6 +800,9 @@ class Pipeline:
         )
         for stage, row in usage["by_stage"].items():
             lines.append(f"- {stage}: {row}")
+        agents = self.agent_usage()
+        if agents:
+            lines.append(f"- openJiuwen experiment agents (from their agent traces): {agents}")
         if gates.get("findings"):
             lines += ["", "## Remaining gate findings", ""]
             for f in gates["findings"]:

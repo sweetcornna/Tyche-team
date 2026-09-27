@@ -63,28 +63,10 @@ uv pip install --no-deps -r "$REQS"
 uv pip install --no-deps -e .
 uv pip install "ruff>=0.11.2"
 
-# openjiuwen's experiment coding agent reads the SDK reference docs from
-# <site-packages>/docs (agent-core's docs/ tree), which a pip install does not ship.
-# Fetch exactly the pinned commit's docs/ so generated experiment code is grounded.
-SITE="$("$VENV_DIR/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
-if [[ ! -d "$SITE/docs/en" ]]; then
-  PIN="$(grep -o 'agent-core.git@[0-9a-f]\{40\}' pyproject.toml | head -1 | cut -d@ -f2)"
-  DOCS_TMP="$(mktemp -d -t tyche-agentcore-docs.XXXXXX)"
-  for REMOTE in https://gitcode.com/openJiuwen/agent-core.git https://github.com/openJiuwen-ai/agent-core.git; do
-    if git -C "$DOCS_TMP" init -q 2>/dev/null \
-      && git -C "$DOCS_TMP" remote add origin "$REMOTE" 2>/dev/null \
-      && with_timeout 300 git -C "$DOCS_TMP" fetch -q --depth 1 --filter=blob:none origin "$PIN" \
-      && git -C "$DOCS_TMP" sparse-checkout set docs \
-      && git -C "$DOCS_TMP" checkout -q FETCH_HEAD; then
-      rm -rf "$SITE/docs" && mv "$DOCS_TMP/docs" "$SITE/docs"
-      echo "[tyche] installed openjiuwen reference docs ($PIN) from $REMOTE"
-      break
-    fi
-    rm -rf "$DOCS_TMP" && DOCS_TMP="$(mktemp -d -t tyche-agentcore-docs.XXXXXX)"
-  done
-  rm -rf "$DOCS_TMP"
-  [[ -d "$SITE/docs/en" ]] || echo "[tyche] warning: could not fetch openjiuwen reference docs" >&2
-fi
+# openjiuwen's experiment coding agent reads the SDK reference docs from <site-packages>/docs,
+# which a pip install does not ship; fetch exactly the pinned commit's docs/.
+PIN="$(grep -o 'agent-core.git@[0-9a-f]\{40\}' pyproject.toml | head -1 | cut -d@ -f2)"
+scripts/tyche/fetch_openjiuwen_docs.sh "$VENV_DIR/bin/python" "$PIN"
 # The `tyche ui` web app ships as a prebuilt bundle in tyche/web/frontend/dist; build it when Node is available.
 if command -v npm >/dev/null; then
   if npm --prefix tyche/web/frontend ci --no-audit --no-fund >/dev/null && npm --prefix tyche/web/frontend run build >/dev/null; then

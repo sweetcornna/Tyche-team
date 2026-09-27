@@ -268,7 +268,9 @@ def agent_handlers(state: dict[str, Any], review) -> dict[str, Any]:
             return _call("write_section", section=name,
                          latex=_section(name, system + "\n" + user) + "\n\n" + WORDS["filler"] * 4)
         if "Write the complete paper" in task or "are still not written" in task:
-            written = set(re.findall(r'<call tool="write_section">\n<arg name="section">\n(\w+)', "".join(done_turns)))
+            # Sections written anywhere in this session, so a resumed session continues where it stopped.
+            earlier = "".join(t["content"] for t in history if t["role"] == "assistant")
+            written = set(re.findall(r'<call tool="write_section">\n<arg name="section">\n(\w+)', earlier))
             todo = [name for name in WRITE_ORDER if name not in written]
             if todo:
                 name = todo[0]

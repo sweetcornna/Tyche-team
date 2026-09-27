@@ -46,6 +46,8 @@ from tyche.textutil import count_tokens, truncate_tokens
 BeforeTool = Callable[["AgentSession", ToolCall, Tool], "str | None | Awaitable[str | None]"]
 AfterTool = Callable[["AgentSession", ToolCall, Tool, ToolResult], "str | None | Awaitable[str | None]"]
 OnStop = Callable[["AgentSession"], "str | None | Awaitable[str | None]"]
+# Called before every turn after the first, with the message about to be sent (e.g. to autosave).
+BeforeTurn = Callable[["AgentSession", str], "None | Awaitable[None]"]
 
 COMPACT_INSTRUCTION = (
     "Your conversation is about to be compacted to save context. Write a summary that lets you continue "
@@ -61,6 +63,7 @@ class Hooks:
     before_tool: list[BeforeTool] = field(default_factory=list)
     after_tool: list[AfterTool] = field(default_factory=list)
     on_stop: list[OnStop] = field(default_factory=list)
+    before_turn: list[BeforeTurn] = field(default_factory=list)
 
 
 async def _maybe(value: Any) -> Any:
@@ -171,6 +174,10 @@ class AgentSession:
             "compactions": self.compactions,
         }
 
+    def resume_with(self, message: str) -> None:
+        """Send ``message`` (e.g. the tool results of an interrupted turn) first with the next task."""
+        self._pending = message
+
     def import_state(self, state: dict[str, Any] | None) -> bool:
         """Resume a saved session if it was built with the same instructions, tools, and context."""
         if not state or state.get("system") != self.system:
@@ -268,6 +275,9 @@ class AgentSession:
         stop_blocks = 0
         calls_made = 0
         for turn in range(1, limit + 1):
+            if turn > 1:
+                for hook in self.hooks.before_turn:
+                    await _maybe(hook(self, message))
             if self.conversation.tokens() + count_tokens(message) > self.compact_at_tokens and self.conversation.turns:
                 message = await self._compact(message)
             reply = await self.conversation.ask(self.llm, message, purpose=f"{self.purpose}:turn")

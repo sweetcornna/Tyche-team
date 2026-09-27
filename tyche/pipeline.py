@@ -511,7 +511,8 @@ class Pipeline:
     # -- S4 write --------------------------------------------------------
     async def stage_write(self) -> dict[str, Any]:
         shutil.rmtree(self.ws.stage_dir("write") / "context_manifests", ignore_errors=True)
-        self._agents_dir("write", clear=True)
+        # An interrupted author session left its autosave; keep it (and its transcript) to resume from.
+        self._agents_dir("write", clear=not (self._agents_dir("write") / "author_session.json").exists())
         ctx, _ = self._writing_context()
         composer = self._composer(ctx, "write")
         await composer.draft()

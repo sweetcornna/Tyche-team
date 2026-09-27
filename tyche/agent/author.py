@@ -243,7 +243,7 @@ class AgentAuthor:
             tools=tools,
             policy=self.settings.policy(),
             context=self._context(self.composer.ctx),
-            hooks=Hooks(on_stop=[self._stop_check]),
+            hooks=Hooks(on_stop=[self._stop_check], before_turn=[self._autosave]),
             todos=self.todos,
             max_stop_blocks=self.settings.max_stop_blocks,
             compact_at_tokens=int(self.context_tokens * self.settings.compact_at),
@@ -310,14 +310,57 @@ class AgentAuthor:
                  calls=outcome.tool_calls)
         return outcome
 
+    @property
+    def autosave_path(self) -> Path:
+        return self.work_dir / "author_session.json"
+
+    def _autosave(self, session: AgentSession, message: str) -> None:
+        """Save the drafting session before each turn, so an interrupted write stage resumes where it stopped."""
+        if self._mode != "draft" or self.composer is None or self.desk is None:
+            return
+        write_json_atomic(
+            self.autosave_path,
+            {
+                "mode": "draft",
+                "next_message": message,
+                "session": session.export_state(),
+                "sections": dict(self.composer.sections),
+                "removed": {k: list(v) for k, v in self.composer.removed.items()},
+                "title": self.composer.title,
+                "title_set": self.desk.title_set,
+            },
+        )
+
+    def _resume_draft(self) -> bool:
+        """Restore an interrupted draft saved by :meth:`_autosave`, if it belongs to this session."""
+        composer, desk, session = self._require()
+        if not self.autosave_path.exists():
+            return False
+        try:
+            saved = json.loads(self.autosave_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        if saved.get("mode") != "draft" or not session.import_state(saved.get("session")):
+            self.log("agent.resume_skipped", session="author", reason="context changed since the save")
+            return False
+        composer.sections.update(saved.get("sections") or {})
+        composer.removed.update(saved.get("removed") or {})
+        composer.title = saved.get("title") or composer.title
+        desk.title_set = bool(saved.get("title_set"))
+        session.resume_with(str(saved.get("next_message") or ""))
+        self.log("agent.resumed", session="author", sections=sorted(n for n, b in composer.sections.items() if b.strip()))
+        return True
+
     async def draft_paper(self, composer: "PaperComposer") -> None:
         if self.composer is not composer:
             self.bind(composer)
         _, desk, _ = self._require()
-        self.todos.set(
-            [Todo(name, f"Write the {name.replace('_', ' ')} section.") for name in WRITE_ORDER]
-            + [Todo("title", "Set the title."), Todo("verify", "Run build_paper and fix what it reports.")]
-        )
+        resumed = self._resume_draft()
+        if not resumed:
+            self.todos.set(
+                [Todo(name, f"Write the {name.replace('_', ' ')} section.") for name in WRITE_ORDER]
+                + [Todo("title", "Set the title."), Todo("verify", "Run build_paper and fix what it reports.")]
+            )
         task = (
             "Write the complete paper: all seven sections (" + ", ".join(WRITE_ORDER) + ") and its title. "
             "Your todo list holds a suggested order: substance first, framing last. Write one section per reply "
@@ -325,6 +368,9 @@ class AgentAuthor:
             "every blocker and every major finding you can. Finish with a reply without a tool call once the "
             "checks pass."
         )
+        if resumed:
+            task = ("Your session was interrupted and has been resumed; the draft and your todo list are as you left "
+                    "them (paper_status shows the draft). Continue the task:\n" + task)
         outcome = await self._run("draft", task)
         missing = desk.missing()
         if missing:
@@ -335,8 +381,9 @@ class AgentAuthor:
         if missing:
             raise StageError(
                 f"the author agent stopped ({outcome.status}) without writing: {', '.join(missing)}; "
-                "rerun the write stage or raise agents.max_turns.draft"
+                "rerun the write stage (it resumes this session) or raise agents.max_turns.draft"
             )
+        self.autosave_path.unlink(missing_ok=True)
 
     async def revise_paper(self, findings: list[dict[str, Any]]) -> list[dict[str, str]]:
         """Address review findings in one task; returns the author's responses (fixed or rebutted)."""

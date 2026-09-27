@@ -294,3 +294,71 @@ async def test_experiment_followup_is_recorded_and_passed_to_the_engine(tmp_path
     assert seen["followup"] == "Calibrate difficulty first."
     assert ws.load_text("experiment_followup") == "Calibrate difficulty first."
     assert any(e.get("kind") == "experiments.followup" for e in map(json.loads, (ws.run_dir / "events.jsonl").read_text().splitlines()))
+
+
+@needs_latex
+async def test_an_interrupted_draft_resumes_its_agent_session(tmp_path):
+    """A write stage that dies mid-draft (e.g. the gateway keeps dropping requests) resumes where it stopped."""
+    from tyche.config import TycheConfig, load_direction
+    from tyche.experiments import fixture_engine
+    from tyche.fixtures.literature import mock_transport
+    from tyche.literature import build_clients
+    from tyche.llm import ScriptedLLM, UsageMeter
+    from tyche.memory import MemoryStore
+    from tyche.pipeline import Pipeline, Services
+    from tyche.selftest import PLAN, handlers
+    from tyche.workspace import Workspace
+
+    config = TycheConfig.load(
+        overrides=[f"workspace.root={tmp_path}", "experiments.engine=fixture", "literature.min_papers=4"], env={}
+    )
+    meter = UsageMeter()
+    llm = ScriptedLLM(handlers(), meter=meter)
+    literature = dict(config.get("literature"))
+    literature["min_interval_seconds"] = {}
+    http, searchers, verifier, s2 = build_clients(literature, cache_path=None, env={}, transport=mock_transport())
+    ws = Workspace.create(tmp_path, "r", topic=PLAN["working_title"], direction="memory_engine", config_digest="x")
+    memory = MemoryStore(tmp_path / "memory.db")
+    services = Services(planner=llm, writer=llm, reviewer=llm, searchers=searchers, verifier=verifier, s2=s2,
+                        engine=fixture_engine(), meter=meter)
+    pipeline = Pipeline(config, ws, services, memory, load_direction("memory_engine"), echo=lambda *a: None)
+    try:
+        await pipeline.run(stop_after="analysis")
+        author = llm.handlers["agent:author"]
+        turns = {"n": 0}
+
+        def flaky(system, user, history):
+            turns["n"] += 1
+            if turns["n"] == 4:
+                raise ConnectionError("the gateway dropped the request")
+            return author(system, user, history)
+
+        llm.handlers["agent:author"] = flaky
+        with pytest.raises(ConnectionError):
+            await pipeline.run(stop_after="write")
+        saved_path = ws.stage_dir("write") / "agents" / "author_session.json"
+        saved = json.loads(saved_path.read_text())
+        assert [n for n, b in saved["sections"].items() if b.strip()] == ["method", "experiments", "analysis"]
+
+        seen = []
+
+        def resumed(system, user, history):
+            reply = author(system, user, history)
+            seen.append((user, len(history), reply))
+            return reply
+
+        llm.handlers["agent:author"] = resumed
+        await pipeline.run(stop_after="write")
+        first_user, first_history, first_reply = seen[0]
+        assert first_history == len(saved["session"]["turns"])
+        assert first_user.startswith('<result call="1" tool="update_todos"') and "has been resumed" in first_user
+        assert not saved_path.exists() and ws.stage_status("write") == "done"
+        # The resumed session went on with the next section instead of starting over.
+        assert '<call tool="write_section">\n<arg name="section">\nrelated_work' in first_reply
+        transcript = (ws.stage_dir("write") / "agents" / "transcripts" / "author.jsonl").read_text()
+        assert transcript.count('"kind": "task"') == 2  # the interrupted task and the resumed one, in one file
+        events = [json.loads(line)["kind"] for line in (ws.run_dir / "events.jsonl").read_text().splitlines()]
+        assert "agent.resumed" in events
+    finally:
+        await http.aclose()
+        memory.close()

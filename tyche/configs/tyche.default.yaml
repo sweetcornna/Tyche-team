@@ -102,7 +102,7 @@ experiments:
     - "While implementing code, validate with the smoke test or a tiny subset only; never launch the full experiment there, because the execution stage runs every variant."
     - "Make repeated model calls cache-friendly: put the fixed instructions and any context shared across items first, byte-identical in every call, and the per-item content last, so the provider's prompt cache serves the shared prefix; record the cached prompt tokens the API reports (DeepSeek usage.prompt_cache_hit_tokens, OpenAI usage.prompt_tokens_details.cached_tokens) in the run diagnostics."
     - "Read credentials only from the environment and never print, log, or write API_KEY (or any part of it) to files or outputs."
-    - "Keep each variant's full run under about 600 model calls and run independent calls concurrently (at most 8 at a time) so it finishes well inside the execution timeout; use identical model settings for every variant."
+    - "Model-call budget (a hard limit, not a target): at most 600 model calls per variant and 3,000 in total, counting smoke tests, pilots, calibration, and probes. State the expected number of calls per variant in the design and size seeds, episodes, and items to fit; if a design needs more, reduce them instead of exceeding the budget. Run independent calls concurrently (at most 8 at a time) and use identical model settings for every variant."
 
 analysis:
   bootstrap_resamples: 2000

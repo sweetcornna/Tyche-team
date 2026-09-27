@@ -7,7 +7,7 @@
   "license": "Apache-2.0",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build": "tsc -b && vite build && node scripts/third-party-notices.mjs",
     "typecheck": "tsc -b --noEmit",
     "test": "vitest run",
     "preview": "vite preview"

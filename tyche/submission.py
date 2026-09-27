@@ -637,10 +637,16 @@ def run_config_yaml(package: Path, run_id: str) -> str:
     for spec in models.values():
         if isinstance(spec, dict) and spec.get("api_base"):
             spec["api_base"] = "${API_BASE}"
+    default = models.get("default") or {}
+    # The same environment variables as the packaged defaults, with this run's values as fallbacks.
+    for key, var in (("provider", "MODEL_PROVIDER"), ("model_name", "MODEL_NAME"), ("context_window", "MODEL_CONTEXT_WINDOW")):
+        if default.get(key) not in (None, ""):
+            default[key] = f"${{{var}:-{default[key]}}}"
     header = (
-        f"# Effective configuration of run {run_id} (run_record/config.json in evidence/{run_id}/),\n"
-        "# with the model endpoint replaced by ${API_BASE}. Credentials never appear here: the key is read\n"
-        "# from the environment variable named by api_key_env. Use it as\n"
+        f"# Effective configuration of run {run_id} (run_record/config.json in evidence/{run_id}/).\n"
+        "# The endpoint comes from ${API_BASE}; MODEL_PROVIDER, MODEL_NAME and MODEL_CONTEXT_WINDOW override\n"
+        "# the run's own values. Credentials never appear here: the key is read from the environment\n"
+        "# variable named by api_key_env. Use it as\n"
         "#   python main.py run --config config.yaml --topic ... --direction ...\n"
     )
     return header + yaml.safe_dump(data, sort_keys=False, allow_unicode=True, width=110)

@@ -24,11 +24,19 @@ cd "$ROOT"
 
 command -v uv >/dev/null || { echo "uv is required: https://docs.astral.sh/uv/" >&2; exit 1; }
 
+# GNU timeout is not part of macOS; use coreutils' gtimeout there, or run unbounded.
+with_timeout() {
+  if command -v timeout >/dev/null; then timeout "$@"
+  elif command -v gtimeout >/dev/null; then gtimeout "$@"
+  else shift; "$@"
+  fi
+}
+
 REQS="$(mktemp -t tyche-reqs.XXXXXX.txt)"
 trap 'rm -f "$REQS"' EXIT
 uv export --frozen --no-hashes --no-emit-project --extra test > "$REQS"
 
-if timeout 20 git ls-remote https://gitcode.com/openJiuwen/agent-core.git HEAD >/dev/null 2>&1; then
+if with_timeout 20 git ls-remote https://gitcode.com/openJiuwen/agent-core.git HEAD >/dev/null 2>&1; then
   echo "[tyche] gitcode.com reachable; using upstream pins as-is"
 else
   echo "[tyche] gitcode.com unreachable; using GitHub mirrors of the same commits"
@@ -39,7 +47,7 @@ else
   rm -f "$REQS.bak"
 fi
 
-if grep -q "gitcode.com" "$REQS" && ! timeout 20 git ls-remote https://gitcode.com/openJiuwen/agent-core.git HEAD >/dev/null 2>&1; then
+if grep -q "gitcode.com" "$REQS" && ! with_timeout 20 git ls-remote https://gitcode.com/openJiuwen/agent-core.git HEAD >/dev/null 2>&1; then
   echo "[tyche] unresolved gitcode requirement remains:" >&2
   grep "gitcode.com" "$REQS" >&2
   exit 1
@@ -65,7 +73,7 @@ if [[ ! -d "$SITE/docs/en" ]]; then
   for REMOTE in https://gitcode.com/openJiuwen/agent-core.git https://github.com/openJiuwen-ai/agent-core.git; do
     if git -C "$DOCS_TMP" init -q 2>/dev/null \
       && git -C "$DOCS_TMP" remote add origin "$REMOTE" 2>/dev/null \
-      && timeout 300 git -C "$DOCS_TMP" fetch -q --depth 1 --filter=blob:none origin "$PIN" \
+      && with_timeout 300 git -C "$DOCS_TMP" fetch -q --depth 1 --filter=blob:none origin "$PIN" \
       && git -C "$DOCS_TMP" sparse-checkout set docs \
       && git -C "$DOCS_TMP" checkout -q FETCH_HEAD; then
       rm -rf "$SITE/docs" && mv "$DOCS_TMP/docs" "$SITE/docs"

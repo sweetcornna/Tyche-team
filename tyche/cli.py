@@ -191,8 +191,10 @@ async def _cmd_review(args: argparse.Namespace) -> int:
 async def _probe(url: str) -> str:
     import httpx
 
+    # Any HTTP answer, a redirect included, shows the host is reachable. Following redirects
+    # would report gateways that bounce a bare /v1 path (e.g. to /v1/) as unreachable.
     try:
-        async with httpx.AsyncClient(timeout=8, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=8, follow_redirects=False) as client:
             response = await client.get(url)
         return f"reachable (HTTP {response.status_code})"
     except Exception as exc:  # noqa: BLE001 - report any failure mode

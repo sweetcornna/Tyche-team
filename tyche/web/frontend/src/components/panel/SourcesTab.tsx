@@ -5,7 +5,7 @@ import { api } from "../../api/client";
 import type { Reference } from "../../api/types";
 import { useAsync } from "../../lib/hooks";
 import { useI18n } from "../../lib/i18n";
-import { humanize } from "../../lib/format";
+import { humanize, safeUrl } from "../../lib/format";
 import { Badge, Segmented } from "../ui";
 import { PanelLoading, PanelMessage, type TabProps } from "./RightPanel";
 
@@ -74,7 +74,7 @@ function SourceRow({ paper, open, onToggle }: { paper: Reference; open: boolean;
     <li className="px-5 py-3.5">
       <div className="flex items-start gap-3">
         <div className="min-w-0 flex-1">
-          <a href={paper.url} target="_blank" rel="noopener noreferrer" className="group inline text-[14px] font-medium leading-snug hover:underline">
+          <a href={safeUrl(paper.url)} target="_blank" rel="noopener noreferrer" className="group inline text-[14px] font-medium leading-snug hover:underline">
             {paper.title}
             <ExternalLink className="ml-1 inline h-3 w-3 text-faint opacity-0 group-hover:opacity-100" />
           </a>

@@ -105,3 +105,14 @@ export function elapsedSince(value: string | null | undefined, now = Date.now())
   const ms = parseTime(value);
   return ms == null ? null : Math.max(0, (now - ms) / 1000);
 }
+
+/** An external link from fetched metadata, or undefined unless it is plain http(s). */
+export function safeUrl(url: string | null | undefined): string | undefined {
+  if (!url) return undefined;
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "http:" || parsed.protocol === "https:" ? parsed.href : undefined;
+  } catch {
+    return undefined;
+  }
+}

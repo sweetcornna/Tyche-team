@@ -3,7 +3,7 @@ import { AlertTriangle, CheckCircle2, ChevronRight, CircleHelp, Hash, Quote } fr
 import { Fragment, useMemo, useState, type ReactNode } from "react";
 import { api } from "../../api/client";
 import type { Claim, ClaimStatus, LineageGraph, RevisionRound } from "../../api/types";
-import { formatMetric, humanize } from "../../lib/format";
+import { formatMetric, humanize, safeUrl } from "../../lib/format";
 import { useAsync } from "../../lib/hooks";
 import { useI18n, type MessageKey } from "../../lib/i18n";
 import { StatusBar } from "../charts";
@@ -131,6 +131,11 @@ function ClaimRow({ claim }: { claim: Claim }) {
                       · {n.match.source}
                       {n.match.metrics_file ? ` · ${n.match.metrics_file}` : ""}
                     </span>
+                    {n.ambiguous && (
+                      <span className="block text-warn" title={(n.alternatives ?? []).join("\n")}>
+                        {t("claims.ambiguous", { n: n.alternatives?.length ?? 0 })}
+                      </span>
+                    )}
                   </span>
                 ) : (
                   <span className="text-bad">{t("claims.unmatched")}</span>
@@ -151,8 +156,8 @@ function ClaimRow({ claim }: { claim: Claim }) {
                 <span className="min-w-0">
                   <code className="rounded bg-subtle/[0.06] px-1 font-mono">{c.key}</code>{" "}
                   {c.known ? (
-                    c.url ? (
-                      <a href={c.url} target="_blank" rel="noopener noreferrer" className="text-muted hover:text-fg hover:underline">
+                    safeUrl(c.url) ? (
+                      <a href={safeUrl(c.url)} target="_blank" rel="noopener noreferrer" className="text-muted hover:text-fg hover:underline">
                         {c.title}
                         {c.year ? ` (${c.year})` : ""}
                       </a>

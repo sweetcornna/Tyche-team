@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { dateGroup, formatDuration, formatMetric, formatP, formatTokens, groupRuns } from "./format";
+import { dateGroup, formatDuration, formatMetric, formatP, formatTokens, groupRuns, safeUrl } from "./format";
 import { translate } from "./i18n";
 import type { RunSummary } from "../api/types";
 
@@ -92,5 +92,16 @@ describe("translate plurals", () => {
     expect(translate("en", "claims.nCitations", { n: 1 })).toBe("1 citation");
     expect(translate("en", "claims.nCitations", { n: 3 })).toBe("3 citations");
     expect(translate("zh", "claims.nCitations", { n: 1 })).toBe("1 条引用");
+  });
+});
+
+describe("safeUrl", () => {
+  it("keeps http(s) links and drops every other scheme", () => {
+    expect(safeUrl("https://arxiv.org/abs/0000.00001")).toBe("https://arxiv.org/abs/0000.00001");
+    expect(safeUrl("http://example.test/a b")).toBe("http://example.test/a%20b");
+    expect(safeUrl("javascript:alert(1)")).toBeUndefined();
+    expect(safeUrl("data:text/html,x")).toBeUndefined();
+    expect(safeUrl("not a url")).toBeUndefined();
+    expect(safeUrl(null)).toBeUndefined();
   });
 });

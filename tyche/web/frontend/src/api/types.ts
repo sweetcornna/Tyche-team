@@ -389,6 +389,10 @@ export interface ClaimNumber {
     source: "analysis" | "setup" | string;
     metrics_file: string | null;
   } | null;
+  /** Other registered values the number also rounds to, best-ranked first. */
+  alternatives?: string[];
+  /** The attribution is a guess: equally ranked values differ, or only a fraction x 100 fits. */
+  ambiguous?: boolean;
 }
 
 export interface ClaimCitation {

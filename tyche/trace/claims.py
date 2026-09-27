@@ -482,37 +482,78 @@ def parse_label(
     return out
 
 
+def _fits(token: str, percent: bool, entry: NumberEntry) -> tuple[bool, float] | None:
+    """How ``token`` fits ``entry`` under the number gate's rule: (as a percentage of a fraction, rounding error).
+
+    Mirrors ``NumberRegistry.match`` so the map and the gate agree on what is matched at all.
+    """
+    try:
+        x = float(token)
+    except ValueError:
+        return None
+    signed = token.strip().startswith("-")
+    decimals = len(token.split(".", 1)[1]) if "." in token else 0
+    tol = 0.5 * 10 ** (-decimals) + 1e-9
+    forms = [(entry.value, False)] if signed else [(entry.value, False), (abs(entry.value), False)]
+    if percent or abs(entry.value) <= 1.0:
+        forms += [(value * 100.0, True) for value, _ in list(forms)]
+    fits = [(scaled, abs(value - x)) for value, scaled in forms if abs(value - x) <= tol]
+    return min(fits, key=lambda f: (f[1], f[0])) if fits else None
+
+
+def _label_words(parsed: dict[str, Any], label: str) -> set[str]:
+    words: set[str] = set()
+    for part in (parsed.get("variant"), parsed.get("metric"), (parsed.get("comparison") or {}).get("baseline")):
+        if part:
+            words |= {w for w in re.split(r"[^a-z0-9]+", str(part).lower()) if len(w) > 2}
+    return words or {w for w in re.split(r"[^a-z0-9]+", label.lower()) if len(w) > 2}
+
+
 def _number(
     token: str,
     percent: bool,
-    singles: list[tuple[NumberEntry, NumberRegistry]],
     registry: NumberRegistry,
     analysis: dict[str, Any] | None,
     metrics_files: dict[str, str],
+    sentence_words: set[str],
 ) -> dict[str, Any]:
-    entry = registry.match(token, percent=percent)
-    match = None
-    alternatives: list[str] = []
-    if entry is not None:
+    """The registered value a number most plausibly states, with every other value it also fits.
+
+    The gate accepts a token that rounds any registered value; the map has to say which one the
+    sentence means. Candidates are ranked by scale (a token written without % does not state a
+    fraction times 100, and one with % prefers a percentage), then by how many of the label's
+    variant and metric words the sentence uses, then by rounding error. When the best candidates
+    tie on scale and wording but hold different values, the attribution is marked ambiguous.
+    """
+    ranked = []
+    for index, entry in enumerate(registry.entries):
+        fit = _fits(token, percent, entry)
+        if fit is None:
+            continue
+        scaled, error = fit
         parsed = parse_label(entry.label, analysis, metrics_files)
-        match = {
-            "label": entry.label,
-            "value": entry.value,
-            "kind": entry.kind,
-            "variant": parsed["variant"],
-            "metric": parsed["metric"],
-            "stat": parsed["stat"],
-            "comparison": parsed["comparison"],
-            "source": parsed["source"],
-            "metrics_file": metrics_files.get(parsed["variant"]) if parsed["variant"] else None,
-        }
-        # Every other registered value the token is also a rounding of: the gate's first match
-        # need not be the value the sentence means (0.100 is both a CI half-width and a difference).
-        for other, single in singles:
-            if other is not entry and other.label not in alternatives and other.label != entry.label:
-                if single.match(token, percent=percent) is not None:
-                    alternatives.append(other.label)
-    return {"text": token, "percent": percent, "match": match, "alternatives": alternatives}
+        as_percent = scaled or entry.label.endswith("percent")
+        overlap = len(_label_words(parsed, entry.label) & sentence_words)
+        ranked.append(((as_percent != percent, -overlap), error, index, entry, parsed))
+    if not ranked:
+        return {"text": token, "percent": percent, "match": None, "alternatives": [], "ambiguous": False}
+    ranked.sort(key=lambda r: (r[0], r[1], r[2]))
+    rank, _, _, entry, parsed = ranked[0]
+    # A bare count that only fits a fraction times 100 ("96 events" vs accuracy 0.96) is a guess.
+    ambiguous = rank[0] or any(r[0] == rank and abs(r[3].value - entry.value) > 1e-12 for r in ranked[1:])
+    match = {
+        "label": entry.label,
+        "value": entry.value,
+        "kind": entry.kind,
+        "variant": parsed["variant"],
+        "metric": parsed["metric"],
+        "stat": parsed["stat"],
+        "comparison": parsed["comparison"],
+        "source": parsed["source"],
+        "metrics_file": metrics_files.get(parsed["variant"]) if parsed["variant"] else None,
+    }
+    alternatives = list(dict.fromkeys(r[3].label for r in ranked[1:] if r[3].label != entry.label))
+    return {"text": token, "percent": percent, "match": match, "alternatives": alternatives, "ambiguous": ambiguous}
 
 
 # -- citations -------------------------------------------------------------------
@@ -554,7 +595,6 @@ def build_claim_map(
     if not isinstance(registry, NumberRegistry):
         registry = NumberRegistry.from_list(list(registry or []))
     files = dict(metrics_files or {})
-    singles = [(entry, NumberRegistry([entry])) for entry in registry.entries]
     by_key: dict[str, dict[str, Any]] = {}
     for paper in papers or []:
         key = str(paper.get("key") or "")
@@ -578,7 +618,8 @@ def build_claim_map(
             keys = _cite_keys(latex)
             if not tokens and not keys:
                 continue
-            numbers = [_number(tok, pct, singles, registry, analysis, files) for tok, pct, _ in tokens]
+            words = {w for w in re.split(r"[^a-z0-9]+", plain_text(latex).lower()) if len(w) > 2}
+            numbers = [_number(tok, pct, registry, analysis, files, words) for tok, pct, _ in tokens]
             citations = [_citation(key, by_key, cards_by_key) for key in keys]
             if any(n["match"] is None for n in numbers) or any(not c["known"] for c in citations):
                 status = "unverified"

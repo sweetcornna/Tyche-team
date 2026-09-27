@@ -128,7 +128,7 @@ def test_numbers_match_with_percent_and_sign_and_trace_to_their_source():
     assert low["stat"] == "diff_ci_low" and low["variant"] is None and low["metrics_file"] is None
     assert low["comparison"]["baseline"] == "window" and low["comparison"]["diff"] == 0.1
     assert low["comparison"]["metrics_files"] == ["proposed.metrics.json", "window.metrics.json"]
-    # The gate's first match is kept; every other value the token rounds to is listed.
+    # The best-ranked match is kept (the sentence names proposed, not window); every other value is listed.
     assert numbers["0.100"]["match"]["label"] == "proposed.accuracy.ci_halfwidth"
     assert numbers["0.100"]["alternatives"] == ["proposed-vs-window.accuracy.diff"]
     assert numbers["95"]["match"]["stat"] == "confidence.percent"
@@ -137,6 +137,34 @@ def test_numbers_match_with_percent_and_sign_and_trace_to_their_source():
     # A minus sign must match the registered sign.
     assert second["numbers"][0]["text"] == "-0.812" and second["numbers"][0]["match"] is None
     assert second["status"] == "unverified"
+
+
+def test_number_attribution_prefers_scale_and_wording_and_flags_ties():
+    registry = NumberRegistry()
+    registry.add(0.96, "proposed.accuracy")
+    registry.add(96, "setup:design", "setup")
+    registry.add(0.412, "proposed.recall")
+    registry.add(0.4118, "window.recall")
+    registry.add(0.3, "proposed.stale_rate")
+    registry.add(0.3004, "window.stale_rate")
+    sections = {
+        "experiments": "Each episode holds 96 events and proposed reaches accuracy 0.960. "
+        "Recall is 0.41 on both. The window stale rate is 0.300. Only 96 cases were scored."
+    }
+    first, second, third, fourth = build_claim_map(sections, registry=registry, papers=[], cards=[])["claims"]
+    events, accuracy = first["numbers"]
+    assert events["match"]["label"] == "setup:design" and not events["ambiguous"]
+    assert accuracy["match"]["label"] == "proposed.accuracy" and not accuracy["ambiguous"]
+    recall = second["numbers"][0]
+    assert recall["ambiguous"] and set([recall["match"]["label"], *recall["alternatives"]]) == {"proposed.recall", "window.recall"}
+    stale = third["numbers"][0]
+    assert stale["match"]["label"] == "window.stale_rate" and not stale["ambiguous"]
+    # Without the setup count, a bare 96 still passes the gate as 0.96 x 100, but only as a guess.
+    alone = NumberRegistry([e for e in registry.entries if e.label != "setup:design"])
+    scaled = build_claim_map({"experiments": "Only 96 cases were scored."}, registry=alone, papers=[], cards=[])
+    number = scaled["claims"][0]["numbers"][0]
+    assert number["match"]["label"] == "proposed.accuracy" and number["ambiguous"]
+    assert fourth["numbers"][0]["match"]["label"] == "setup:design"
 
 
 def test_parse_label_grammar_with_and_without_analysis():

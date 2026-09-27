@@ -33,6 +33,7 @@ from tyche.paper.writer import SectionWriter, WritingContext
 from tyche.planning import ResearchPlan, make_plan, plan_markdown
 from tyche.review import FindingsLedger, ReviewPanel, RevisionLoop
 from tyche.textutil import sanitize_untrusted, truncate_tokens
+from tyche.trace import capture_environment, claim_map_for_run
 from tyche.workspace import StageError, Workspace, sha256_file, utcnow, write_json_atomic
 
 
@@ -669,6 +670,17 @@ class Pipeline:
         shutil.copy2(self.ws.latest_path("ledger"), out / "review_ledger.json")
         shutil.copy2(self.ws.run_dir / gates_rec.path, out / "gates.json")
         self._copy_run_record(out / "run_record")
+        # Audit views shipped with the paper: the environment it was packaged in, and the claim-evidence
+        # map of the packaged text. The map is a reader's view, not a gate; the gates above decide release.
+        write_json_atomic(out / "environment.json", capture_environment(config=self.cfg))
+        claims_error = None
+        try:
+            claims = claim_map_for_run(self.ws.run_dir)
+        except Exception as exc:  # noqa: BLE001 - a bug in the audit view must not hide a gated paper
+            claims, claims_error = None, f"{type(exc).__name__}: {exc}"[:500]
+            self.ws.event("package.claims_failed", error=claims_error)
+        if claims is not None:
+            write_json_atomic(out / "claims.json", claims)
         drift = self.ws.verify_provenance()
         provenance = {
             "tyche_version": __version__,
@@ -681,11 +693,16 @@ class Pipeline:
             "artifacts": [r.__dict__ for r in self.ws.records()],
             "drifted_artifacts": drift,
             "paper_pdf_sha256": sha256_file(pdf),
+            "claims": claims["stats"] if claims else None,
+            "claims_error": claims_error,
         }
         write_json_atomic(out / "provenance.json", provenance)
-        report = self._run_report(gates)
+        report = self._run_report(gates, claims["stats"] if claims else None)
         (out / "run_report.md").write_text(report, encoding="utf-8")
-        return {"pdf": str(pdf), "verified": verified, "drifted": len(drift)}
+        info: dict[str, Any] = {"pdf": str(pdf), "verified": verified, "drifted": len(drift)}
+        if claims:
+            info["claims"] = {k: claims["stats"][k] for k in ("claims", "verified", "weak", "unverified")}
+        return info
 
     def _copy_run_record(self, target: Path) -> None:
         """The run record promised by the reproducibility statement: every artifact version plus
@@ -705,7 +722,7 @@ class Pipeline:
             if path.exists():
                 shutil.copy2(path, target / name)
 
-    def _run_report(self, gates: dict[str, Any]) -> str:
+    def _run_report(self, gates: dict[str, Any], claims: dict[str, Any] | None = None) -> str:
         state = self.ws.state
         rounds = self.ws.load_json("review_rounds") if self.ws.latest("review_rounds") else []
         self._flush_usage()
@@ -720,6 +737,14 @@ class Pipeline:
             f"- Gates: {'PASSED' if gates.get('passed') else 'FAILED -- UNVERIFIED PAPER'}",
             f"- Main-text pages: {gates.get('stats', {}).get('main_pages')}",
             f"- Distinct citations: {gates.get('stats', {}).get('distinct_citations')}",
+        ]
+        if claims:
+            lines.append(
+                f"- Claim-evidence map (claims.json): {claims['claims']} claims, {claims['verified']} verified, "
+                f"{claims['weak']} weakly supported, {claims['unverified']} unverified; "
+                f"{claims['numbers_matched']}/{claims['numbers']} numbers matched to computed values"
+            )
+        lines += [
             "",
             "## Review rounds",
             "",

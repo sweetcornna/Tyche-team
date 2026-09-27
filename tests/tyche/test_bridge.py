@@ -220,6 +220,25 @@ def test_interrupted_manager_attempt_is_resumed(tmp_path, monkeypatch):
     assert _resumable_manager_run(tmp_path, "other") is None
 
 
+def test_an_attempt_interrupted_before_a_replan_is_not_resumed(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from openjiuwen.rsi.artifact_rsi.paper_opt.auto_research.modules.manager import artifacts
+
+    from tyche.experiments.bridge import _record_attempt, _resumable_manager_run, inputs_digest
+
+    (tmp_path / "experiments" / "tyche-r1-a1").mkdir(parents=True)
+    monkeypatch.setattr(artifacts, "try_load_state", lambda run_id: SimpleNamespace(terminal=None))
+    old = inputs_digest("plan v1", "summary", "objective", ["c"])
+    new = inputs_digest("plan v2", "summary", "objective", ["c"])
+    assert old != new
+    # An attempt from before inputs were recorded is resumed as before.
+    assert _resumable_manager_run(tmp_path, "r1", new) == "tyche-r1-a1"
+    _record_attempt(tmp_path, "tyche-r1-a1", old)
+    assert _resumable_manager_run(tmp_path, "r1", old) == "tyche-r1-a1"
+    assert _resumable_manager_run(tmp_path, "r1", new) is None
+
+
 
 async def test_code_round_that_changes_nothing_is_retried_with_a_host_instruction(tmp_path, monkeypatch):
     from openjiuwen.rsi.artifact_rsi.paper_opt.auto_research.common import workspace as arw

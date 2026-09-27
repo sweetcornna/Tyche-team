@@ -464,15 +464,20 @@ class OpenJiuwenEngine:
             ),
             reflection=ReflectionAgent(config, model=self.model),
         )
+        objective = objective_text(plan, self.settings)
+        constraints = [str(c) for c in self.settings.get("constraints") or []]
+        digest = inputs_digest(plan_markdown(plan), summary_path.read_text(encoding="utf-8"), objective, constraints)
         # An interrupted attempt (no terminal record) is resumed where it stopped, keeping its
-        # design revisions and results. Otherwise a fresh manager run per attempt: a rerun must
-        # never mix in metrics or reflections from an earlier, finished attempt's variants.
+        # design revisions and results, but only if it was started from the same plan, survey,
+        # objective, and constraints. Otherwise a fresh manager run per attempt: a rerun must
+        # never mix in metrics or reflections from an earlier attempt's variants.
         arw.set_project_root(root)
-        manager_run_id = _resumable_manager_run(root, run_id)
+        manager_run_id = _resumable_manager_run(root, run_id, digest)
         resume = manager_run_id is not None
         if manager_run_id is None:
             attempt = 1 + len(_attempt_dirs(root, run_id))
             manager_run_id = f"tyche-{run_id}-a{attempt}"
+        _record_attempt(root, manager_run_id, digest)
         with model_environment(self.subject):
             arw.set_project_root(root)
             terminal = await runtime.arun(
@@ -480,8 +485,8 @@ class OpenJiuwenEngine:
                 topic=plan.working_title,
                 research_paths=["inputs/research_summary.md", "inputs/research_plan.md"],
                 run_id=manager_run_id,
-                objective=objective_text(plan, self.settings),
-                constraints=[str(c) for c in self.settings.get("constraints") or []],
+                objective=objective,
+                constraints=constraints,
                 initial_prompt=plan_markdown(plan),
                 task_mode="create_new_paper",
             )
@@ -526,8 +531,36 @@ def _attempt_dirs(root: Path, run_id: str) -> list[Path]:
     return [path for _, path in sorted(found)]
 
 
-def _resumable_manager_run(root: Path, run_id: str) -> str | None:
-    """The latest attempt's manager run id if it was interrupted before reaching a terminal state."""
+# Which inputs each manager attempt was started from (Tyche's file, beside openjiuwen's experiments/).
+_ATTEMPTS_FILE = "tyche_attempts.json"
+
+
+def inputs_digest(plan_md: str, summary: str, objective: str, constraints: list[str]) -> str:
+    """Identity of the inputs an experiment attempt works from."""
+    digest = hashlib.sha256()
+    for part in (plan_md, summary, objective, *constraints):
+        digest.update(part.encode("utf-8") + b"\0")
+    return digest.hexdigest()[:16]
+
+
+def _recorded_attempts(root: Path) -> dict[str, str]:
+    try:
+        data = json.loads((root / _ATTEMPTS_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+
+
+def _record_attempt(root: Path, manager_run_id: str, digest: str) -> None:
+    recorded = _recorded_attempts(root)
+    recorded[manager_run_id] = digest
+    (root / _ATTEMPTS_FILE).write_text(json.dumps(recorded, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _resumable_manager_run(root: Path, run_id: str, digest: str | None = None) -> str | None:
+    """The latest attempt's manager run id if it was interrupted before reaching a terminal state
+    and was started from the same inputs (``digest``). An attempt recorded under other inputs, e.g.
+    before a re-plan, is left as it is; one with no record predates the record and is resumed."""
     from openjiuwen.rsi.artifact_rsi.paper_opt.auto_research.modules.manager.artifacts import try_load_state
 
     attempts = _attempt_dirs(root, run_id)
@@ -535,6 +568,8 @@ def _resumable_manager_run(root: Path, run_id: str) -> str | None:
         return None
     state = try_load_state(attempts[-1].name)
     if state is None or getattr(state, "terminal", None) is not None:
+        return None
+    if digest is not None and _recorded_attempts(root).get(attempts[-1].name, digest) != digest:
         return None
     return attempts[-1].name
 

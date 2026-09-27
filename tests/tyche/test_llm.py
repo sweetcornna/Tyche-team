@@ -246,3 +246,42 @@ async def test_requests_tyche_does_not_build_carry_the_per_role_key(openai_compa
     llm, _ = _client(base, monkeypatch, cache="openai")
     await llm.openjiuwen_model.invoke([{"role": "user", "content": "agent turn"}])
     assert seen["body"]["prompt_cache_key"] == cache.routing_key(llm.route, "writer")
+
+
+async def test_transient_transport_errors_are_retried_and_others_are_not(openai_compatible_server, monkeypatch):
+    import tyche.llm as llm_module
+    from tyche.llm import is_transient
+
+    monkeypatch.setattr(llm_module, "TRANSPORT_RETRY_DELAYS", (0.0, 0.0, 0.0, 0.0))
+    base, seen = openai_compatible_server
+    llm, _ = _client(base, monkeypatch)
+    real = llm._model
+
+    class Flaky:
+        def __init__(self, failures, error):
+            self.failures, self.error, self.calls = failures, error, 0
+
+        async def invoke(self, *args, **kwargs):
+            self.calls += 1
+            if self.calls <= self.failures:
+                raise RuntimeError(self.error)
+            return await real.invoke(*args, **kwargs)
+
+    llm._model = Flaky(2, "[181001] model call failed, reason: openAI API async invoke error: APIConnectionError: Connection error.")
+    reply = await llm.complete(system="s", user="u", purpose="p")
+    assert reply.text and llm._model.calls == 3
+
+    llm._model = Flaky(9, "Error code: 400 - max_tokens 503 is too large")
+    with pytest.raises(RuntimeError):
+        await llm.complete(system="s", user="u", purpose="p")
+    assert llm._model.calls == 1  # not transient: no retry
+
+    llm._model = Flaky(9, "Error code: 503 - upstream unavailable")
+    with pytest.raises(RuntimeError):
+        await llm.complete(system="s", user="u", purpose="p")
+    assert llm._model.calls == 5  # the first try plus four retries, then the error propagates
+    assert is_transient(RuntimeError("wrapped")) is False
+    try:
+        raise RuntimeError("invoke failed") from TimeoutError("Request timed out.")
+    except RuntimeError as exc:
+        assert is_transient(exc)

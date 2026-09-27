@@ -60,7 +60,7 @@ Tyche 既能就三个方向**生成论文**（`--direction context_engineering |
 | `tyche/` | 全部自研代码：配置、LLM 封装、工作区与溯源、记忆引擎、文献、实验桥接、统计分析、论文写作与编译、门禁、评审、演进、流水线、CLI、离线自检 |
 | `tyche/trace/` | 可追溯层：论断–证据地图、逐轮修订差异、产物谱系、环境快照、打包目录离线核验 `tyche verify`（均由确定性代码计算，不调用模型） |
 | `tyche/web/` | 科研工作台 `tyche ui`：FastAPI 后端（只监听本机、Host/Origin 校验、SSE 实时推送）与 React 前端 |
-| `tests/tyche/` | 241 个离线单元/端到端测试（含真实 LaTeX 编译的完整自检与 Web API 测试） |
+| `tests/tyche/` | 242 个离线单元/端到端测试（含真实 LaTeX 编译的完整自检与 Web API 测试） |
 | `jiuwenswarm/resources/agent/workspace/skills/tyche-iclr-paper/` | SwarmFlow 蜂群技能：按阶段编排，可在 TUI `/swarmflows` 监控，支持人工审批研究计划 |
 | `jiuwenswarm/resources/agent/workspace/skills/tyche-paper/` | Agent 模式技能：在对话中驱动 `tyche` |
 | `scripts/tyche/install_dev.sh` | 开发环境安装；gitcode 不可达时自动改用 GitHub 镜像的**同一提交** |
@@ -196,7 +196,7 @@ tyche ui                       # 打开 http://127.0.0.1:8765 ；--port、--work
 ```bash
 source .venv/bin/activate
 ruff check tyche tests/tyche
-pytest tests/tyche                       # 241 项，含真实 LaTeX 编译的端到端自检
+pytest tests/tyche                       # 242 项，含真实 LaTeX 编译的端到端自检
 tyche selftest
 npm --prefix tyche/web/frontend test     # 前端单元测试（需 Node.js）
 python jiuwenswarm/resources/agent/workspace/skills/swarmskill-creator/scripts/validate_swarmskill.py \

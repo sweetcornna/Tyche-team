@@ -29,7 +29,7 @@ from tyche.literature import build_clients
 from tyche.llm import ScriptedLLM, UsageMeter
 from tyche.memory import MemoryStore
 from tyche.pipeline import Pipeline, Services
-from tyche.workspace import Workspace
+from tyche.workspace import Workspace, write_json_atomic
 
 
 def _block(text: str, name: str) -> str:
@@ -358,6 +358,7 @@ async def run_selftest(
         http, searchers, verifier, s2 = build_clients(literature, cache_path=None, env={}, transport=mock_transport())
         ws = Workspace.create(root, run_id, topic=PLAN["working_title"], direction="memory_engine",
                               config_digest=config.digest())
+        write_json_atomic(ws.run_dir / "config.json", config.data)  # as `tyche run` does
         memory = MemoryStore(root / "memory.db")
         services = Services(
             planner=llm, writer=llm, reviewer=llm, searchers=searchers, verifier=verifier, s2=s2,
@@ -387,6 +388,10 @@ async def run_selftest(
             },
             "cache_breaks": usage["total"]["cache_breaks"],
         }
+        # The package must pass the same offline audit an auditor would run on it (tyche verify).
+        from tyche.trace.verify import verify_package
+
+        summary["verify"] = {check.name: check.ok for check in verify_package(package)}
         memory.close()
         if keep is not None:
             keep.mkdir(parents=True, exist_ok=True)
@@ -399,6 +404,7 @@ async def run_selftest(
             and not summary["drifted_artifacts"]
             and summary["main_pages"] >= 1
             and summary["cache_breaks"] == 0
+            and all(summary["verify"].values())
         )
         summary["ok"] = bool(ok)
         return summary

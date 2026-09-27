@@ -95,6 +95,16 @@ def _lock_run(root: Path, run_id: str) -> Any:
 
 
 async def _cmd_run(args: argparse.Namespace) -> int:
+    locks: list[Any] = []
+    try:
+        return await _run(args, locks)
+    finally:
+        # Released however the run ends, not whenever its frame happens to be collected.
+        for handle in locks:
+            handle.close()
+
+
+async def _run(args: argparse.Namespace, locks: list[Any]) -> int:
     from tyche.memory import MemoryStore
     from tyche.pipeline import Pipeline
 
@@ -105,7 +115,7 @@ async def _cmd_run(args: argparse.Namespace) -> int:
     if resumed:
         if not args.run_id:
             raise ConfigError("--resume needs --run-id")
-        _run_lock = _lock_run(root, args.run_id)  # held until this run ends
+        locks.append(_lock_run(root, args.run_id))
         ws = Workspace.open(root, args.run_id)
         topic, direction = ws.state["topic"], ws.state["direction"]
         if (args.topic and args.topic != topic) or (args.direction and args.direction != direction):
@@ -131,7 +141,7 @@ async def _cmd_run(args: argparse.Namespace) -> int:
         run_id = args.run_id or f"{datetime.now(timezone.utc):%Y%m%d-%H%M%S}-{slugify(args.topic, 32)}"
         topic, direction = args.topic, args.direction
         load_direction(direction)
-        _run_lock = _lock_run(root, run_id)  # held until this run ends
+        locks.append(_lock_run(root, run_id))
         # Build services first so missing credentials fail before an empty run directory is created.
         services, http = build_services(config)
         ws = Workspace.create(root, run_id, topic=topic, direction=direction, config_digest=config.digest())
@@ -166,6 +176,24 @@ async def _cmd_run(args: argparse.Namespace) -> int:
         if package.exists():
             print(f"[tyche] paper: {package}")
     return 0
+
+
+def _cmd_verify(args: argparse.Namespace) -> int:
+    from tyche.trace.verify import locate_package, report, verify_package
+
+    try:
+        package = locate_package(Path(args.package))
+    except FileNotFoundError as exc:
+        raise ConfigError(str(exc)) from None
+    checks = verify_package(package)
+    if args.json:
+        print(json.dumps(report(checks), indent=2, ensure_ascii=False))
+    else:
+        print(f"[tyche] verifying {package} (offline; no model calls)")
+        for check in checks:
+            print(f"  {'PASS' if check.ok else 'FAIL'}  {check.name:<14} {check.detail}")
+        print(f"verify: {'PASSED' if all(c.ok for c in checks) else 'FAILED'}")
+    return 0 if all(c.ok for c in checks) else 1
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
@@ -387,6 +415,12 @@ def build_parser() -> argparse.ArgumentParser:
     common(status)
     status.add_argument("--run-id")
 
+    verify = sub.add_parser(
+        "verify", help="offline check of a packaged paper: hashes, recomputed statistics, numbers, citations, claims"
+    )
+    verify.add_argument("package", help="a package directory, or a run directory that contains package/")
+    verify.add_argument("--json", action="store_true", help="print the checks as JSON")
+
     review = sub.add_parser("review", help="simulated 7-dimension review of any paper PDF")
     common(review)
     review.add_argument("pdf")
@@ -423,6 +457,8 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(_cmd_run(args))
         if args.command == "status":
             return _cmd_status(args)
+        if args.command == "verify":
+            return _cmd_verify(args)
         if args.command == "review":
             return asyncio.run(_cmd_review(args))
         if args.command == "doctor":

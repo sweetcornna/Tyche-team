@@ -219,3 +219,36 @@ def test_resume_from_stage_continues_and_keeps_operator_notes(tmp_path, monkeypa
     assert cli.main([*base, "--from-stage", "plan", "--stop-after", "plan", "--notes", "Use three baselines."]) == 0
     assert calls[-1] == {"notes": "Use three baselines.", "stop_after": "plan", "only": None}
     assert cli.main([*base, "--stage", "write", "--from-stage", "write"]) == 2
+
+
+@needs_latex
+async def test_verify_passes_on_a_package_and_catches_tampering(tmp_path):
+    import shutil
+
+    from tyche.trace.verify import verify_package
+
+    summary = await run_selftest(root=tmp_path, echo=lambda *a: None)
+    assert summary["ok"] and all(summary["verify"].values()), summary["verify"]
+    package = tmp_path / "runs" / "selftest" / "package"
+    assert main(["verify", str(package.parent)]) == 0  # a run directory is accepted too
+
+    # Edited experiment metrics: the hashes and the recomputed statistics both catch it.
+    edited = tmp_path / "edited"
+    shutil.copytree(package, edited)
+    metrics = sorted((edited / "run_record" / "artifacts" / "experiment_results").glob("*/*.metrics.json"))[0]
+    data = json.loads(metrics.read_text())
+    rows = data["per_question"]
+    key = next(k for k in ("correct", "exact_match", "success") if k in rows[0])
+    rows[0][key] = not rows[0][key]
+    metrics.write_text(json.dumps(data))
+    failed = {c.name for c in verify_package(edited) if not c.ok}
+    assert {"provenance", "analysis"} <= failed
+
+    # A number edited into the paper source no longer matches any computed value.
+    retouched = tmp_path / "retouched"
+    shutil.copytree(package, retouched)
+    abstract = retouched / "paper_source" / "sections" / "abstract.tex"
+    abstract.write_text(abstract.read_text() + " Accuracy improves by 0.987.")
+    failed = {c.name for c in verify_package(retouched) if not c.ok}
+    assert "paper numbers" in failed and "analysis" not in failed
+    assert main(["verify", str(retouched)]) == 1

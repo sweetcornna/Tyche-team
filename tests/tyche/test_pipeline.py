@@ -252,3 +252,29 @@ async def test_verify_passes_on_a_package_and_catches_tampering(tmp_path):
     failed = {c.name for c in verify_package(retouched) if not c.ok}
     assert "paper numbers" in failed and "analysis" not in failed
     assert main(["verify", str(retouched)]) == 1
+
+
+async def test_experiment_followup_is_recorded_and_passed_to_the_engine(tmp_path):
+    from tyche.experiments import ExperimentOutcome
+    from tyche.selftest import PLAN
+    from tyche.workspace import StageError, Workspace
+
+    ws = Workspace.create(tmp_path, "r", topic="t", direction="memory_engine", config_digest="x")
+    ws.save_json("plan", PLAN, stage="plan")
+    ws.save_text("research_summary", "## Short Summary\nx\n", stage="survey")
+    seen = {}
+
+    class Engine:
+        name = "fake"
+
+        async def run(self, plan, *, summary_path, work_dir, run_id, followup=""):
+            seen["followup"] = followup
+            return ExperimentOutcome("failed", "fake", {}, notes="stopped for the test")
+
+    pipe = _pipeline(tmp_path, ws, experiment_followup="  Calibrate difficulty first.  ")
+    pipe.svc.engine = Engine()
+    with pytest.raises(StageError):
+        await pipe.stage_experiments()
+    assert seen["followup"] == "Calibrate difficulty first."
+    assert ws.load_text("experiment_followup") == "Calibrate difficulty first."
+    assert any(e.get("kind") == "experiments.followup" for e in map(json.loads, (ws.run_dir / "events.jsonl").read_text().splitlines()))

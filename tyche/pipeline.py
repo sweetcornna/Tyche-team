@@ -61,6 +61,7 @@ class Pipeline:
         *,
         allow_gate_failures: bool = False,
         operator_notes: str = "",
+        experiment_followup: str = "",
         skill_export_dir: Path | None = None,
         echo=print,
     ):
@@ -71,6 +72,7 @@ class Pipeline:
         self.direction = direction
         self.allow_gate_failures = allow_gate_failures
         self.operator_notes = operator_notes
+        self.experiment_followup = experiment_followup.strip()
         self.skill_export_dir = skill_export_dir
         self.echo = echo
 
@@ -181,8 +183,16 @@ class Pipeline:
     async def stage_experiments(self) -> dict[str, Any]:
         plan = self.plan()
         work = self.ws.stage_dir("experiments") / "engine"
+        if self.experiment_followup:
+            # An operator instruction to the experiment agents is part of how the results came about.
+            rec = self.ws.save_text("experiment_followup", self.experiment_followup, stage="experiments")
+            self.log("experiments.followup", artifact=rec.id)
         outcome = await self.svc.engine.run(
-            plan, summary_path=self.ws.latest_path("research_summary"), work_dir=work, run_id=self.run_id
+            plan,
+            summary_path=self.ws.latest_path("research_summary"),
+            work_dir=work,
+            run_id=self.run_id,
+            followup=self.experiment_followup,
         )
         self.ws.save_json("experiments", outcome.summary(), stage="experiments")
         if outcome.attempt_dir is not None and outcome.attempt_dir.is_dir():

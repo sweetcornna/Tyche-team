@@ -58,6 +58,8 @@
 
 收集的产物包括各变体的 `results/*.metrics.json`、实验设计文档、生成代码与反思记录。openJiuwen 的 ObservabilityRail 为实验智能体的每次模型调用写下 `agent_trace.jsonl`，Tyche 把本次尝试的轨迹存为 `experiment_traces`，并按模块汇总调用次数、输入、缓存命中与输出 token，存为 `experiment_usage`。无论尝试成功与否都会保存，失败的尝试同样消耗了 token。运行报告与资源报告据此统计实验阶段的用量，同一尝试续跑后只计最新一份，不重复累加。
 
+每次尝试都记录其输入摘要（计划、综述、目标与约束）。被中断的尝试只有在输入未变时才原地续跑；重新规划之后会新开尝试。操作者可以用 `--experiment-followup` 给实验智能体一条指令，这条指令通过 openJiuwen 的续跑引导作用于最近一次尝试（已结束的也会重新打开），并作为 `experiment_followup` 产物记入运行记录。
+
 替代引擎：
 
 - `imported`：读取团队自行产生的 `<variant>.metrics.json` 目录，可附 `design.md` 与 `code/`。

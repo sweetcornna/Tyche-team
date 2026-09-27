@@ -112,7 +112,7 @@ class ExperimentEngine(Protocol):
     name: str
 
     async def run(
-        self, plan: ResearchPlan, *, summary_path: Path, work_dir: Path, run_id: str
+        self, plan: ResearchPlan, *, summary_path: Path, work_dir: Path, run_id: str, followup: str = ""
     ) -> ExperimentOutcome: ...
 
 
@@ -174,7 +174,9 @@ class ImportedEngine:
         self.synthetic = synthetic
         self.name = label
 
-    async def run(self, plan: ResearchPlan, *, summary_path: Path, work_dir: Path, run_id: str) -> ExperimentOutcome:
+    async def run(
+        self, plan: ResearchPlan, *, summary_path: Path, work_dir: Path, run_id: str, followup: str = ""
+    ) -> ExperimentOutcome:
         if self.results_dir is None:
             return ExperimentOutcome("failed", self.name, {}, notes="no results directory configured; pass --results-dir")
         if not self.results_dir.is_dir():
@@ -438,7 +440,12 @@ class OpenJiuwenEngine:
         # The model the generated experiment code calls (via API_* env vars).
         self.subject = subject or spec
 
-    async def run(self, plan: ResearchPlan, *, summary_path: Path, work_dir: Path, run_id: str) -> ExperimentOutcome:
+    async def run(
+        self, plan: ResearchPlan, *, summary_path: Path, work_dir: Path, run_id: str, followup: str = ""
+    ) -> ExperimentOutcome:
+        """Drive one manager attempt. ``followup`` is an operator instruction: it steers the latest
+        attempt through openjiuwen's resume steering (reopening it if it had finished), or, when a
+        fresh attempt starts, is added to its constraints."""
         from openjiuwen.rsi.artifact_rsi.paper_opt.auto_research.common import workspace as arw
         from openjiuwen.rsi.artifact_rsi.paper_opt.auto_research.modules.experiment_design.agent import (
             ExperimentDesignAgent,
@@ -472,11 +479,14 @@ class OpenJiuwenEngine:
         # objective, and constraints. Otherwise a fresh manager run per attempt: a rerun must
         # never mix in metrics or reflections from an earlier attempt's variants.
         arw.set_project_root(root)
-        manager_run_id = _resumable_manager_run(root, run_id, digest)
+        followup = followup.strip()
+        manager_run_id = _resumable_manager_run(root, run_id, digest, steering=bool(followup))
         resume = manager_run_id is not None
         if manager_run_id is None:
             attempt = 1 + len(_attempt_dirs(root, run_id))
             manager_run_id = f"tyche-{run_id}-a{attempt}"
+            if followup:
+                constraints = [*constraints, f"Operator instruction: {followup}"]
         _record_attempt(root, manager_run_id, digest)
         with model_environment(self.subject):
             arw.set_project_root(root)
@@ -489,6 +499,7 @@ class OpenJiuwenEngine:
                 constraints=constraints,
                 initial_prompt=plan_markdown(plan),
                 task_mode="create_new_paper",
+                followup=followup if resume else "",
             )
         results = arw.results_dir(manager_run_id)
         variants = read_metrics_dir(results) if results.is_dir() else {}
@@ -557,17 +568,20 @@ def _record_attempt(root: Path, manager_run_id: str, digest: str) -> None:
     (root / _ATTEMPTS_FILE).write_text(json.dumps(recorded, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def _resumable_manager_run(root: Path, run_id: str, digest: str | None = None) -> str | None:
+def _resumable_manager_run(
+    root: Path, run_id: str, digest: str | None = None, *, steering: bool = False
+) -> str | None:
     """The latest attempt's manager run id if it was interrupted before reaching a terminal state
-    and was started from the same inputs (``digest``). An attempt recorded under other inputs, e.g.
-    before a re-plan, is left as it is; one with no record predates the record and is resumed."""
+    (or, when an operator is ``steering`` it, also if it finished) and was started from the same
+    inputs (``digest``). An attempt recorded under other inputs, e.g. before a re-plan, is left as it
+    is; one with no record predates the record and is resumed."""
     from openjiuwen.rsi.artifact_rsi.paper_opt.auto_research.modules.manager.artifacts import try_load_state
 
     attempts = _attempt_dirs(root, run_id)
     if not attempts:
         return None
     state = try_load_state(attempts[-1].name)
-    if state is None or getattr(state, "terminal", None) is not None:
+    if state is None or (getattr(state, "terminal", None) is not None and not steering):
         return None
     if digest is not None and _recorded_attempts(root).get(attempts[-1].name, digest) != digest:
         return None

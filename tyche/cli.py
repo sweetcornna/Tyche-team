@@ -153,6 +153,10 @@ async def _run(args: argparse.Namespace, locks: list[Any]) -> int:
     elif resumed and ws.latest("operator_notes") is not None:
         # A resumed run that replans keeps the notes it was planned with.
         notes = ws.load_text("operator_notes")
+    followup = ""
+    if args.experiment_followup:
+        path = Path(args.experiment_followup)
+        followup = path.read_text(encoding="utf-8") if path.exists() else args.experiment_followup
     memory = MemoryStore(root / "memory.db")
     skill_dir = Path(args.export_skill_dir).expanduser() if args.export_skill_dir else None
     pipeline = Pipeline(
@@ -163,6 +167,7 @@ async def _run(args: argparse.Namespace, locks: list[Any]) -> int:
         load_direction(direction),
         allow_gate_failures=args.allow_gate_failures,
         operator_notes=notes,
+        experiment_followup=followup,
         skill_export_dir=skill_dir,
     )
     try:
@@ -408,6 +413,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--engine", choices=["openjiuwen", "imported", "fixture"], help="experiment engine")
     run.add_argument("--results-dir", help="with --engine imported: directory of <variant>.metrics.json files")
     run.add_argument("--notes", help="operator notes (text or a file path) for the planner")
+    run.add_argument(
+        "--experiment-followup",
+        help="operator instruction (text or a file path) for openJiuwen's experiment manager; it steers the "
+        "latest experiment attempt, reopening it if it had finished (use with --from-stage experiments)",
+    )
     run.add_argument("--allow-gate-failures", action="store_true", help="package even if gates fail (marked UNVERIFIED)")
     run.add_argument("--export-skill-dir", help="also write active lessons to this JiuwenSwarm skill directory")
 

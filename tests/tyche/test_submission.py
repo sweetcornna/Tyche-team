@@ -27,13 +27,15 @@ def _attempt(tmp_path, name="tyche-r-a1"):
         attempt / "modules" / "manager" / "round_001_attempt_001" / "agent_trace.jsonl",
         {"event": "trace_start"},
         {"event": "model_call_start"},
-        {"event": "model_call_end", "usage": {"input_tokens": 100, "output_tokens": 10, "cache_read_tokens": 60}},
-        {"event": "model_call_end", "usage": {}},
-        {"event": "model_call_error"},
+        {"event": "model_call_end", "call_id": "m1", "usage": {"input_tokens": 100, "output_tokens": 10, "cache_read_tokens": 60}},
+        {"event": "model_call_end", "call_id": "m2", "usage": {}},
+        {"event": "model_call_error", "call_id": "m3"},
+        {"event": "model_call_end", "call_id": None, "usage": {}},  # the rail's closing record of the failed call
     )
     _trace(
         attempt / "modules" / "code_implementation" / "round_002_attempt_001" / "agent_trace.jsonl",
-        {"event": "model_call_end", "usage": {"prompt_tokens": 1000, "completion_tokens": 50, "prompt_cache_hit_tokens": 900}},
+        {"event": "model_call_end", "call_id": "m1",
+         "usage": {"prompt_tokens": 1000, "completion_tokens": 50, "prompt_cache_hit_tokens": 900}},
     )
     (attempt / "modules" / "code_implementation" / "round_002_attempt_001" / "run.py").write_text("print(1)\n")
     return attempt

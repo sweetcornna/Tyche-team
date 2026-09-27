@@ -389,7 +389,8 @@ def openjiuwen_usage(attempt_dir: Path) -> dict[str, Any]:
             event = row.get("event")
             if event == "model_call_error":
                 entry["failed_calls"] += 1
-            if event != "model_call_end":
+            # After an error the rail also closes the call with an empty end record (no call id).
+            if event != "model_call_end" or (row.get("call_id") is None and not row.get("usage")):
                 continue
             entry["calls"] += 1
             usage = row.get("usage") or {}

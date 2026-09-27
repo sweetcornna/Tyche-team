@@ -1,0 +1,44 @@
+/* Design tokens as RGB triplets so Tailwind can apply alpha: rgb(var(--x) / a). */
+:root {
+  --bg-main: 255 255 255;
+  --bg-sidebar: 249 249 249;
+  --bg-elevated: 255 255 255;
+  --bg-subtle: 0 0 0;            /* used at low alpha for hover/active fills */
+  --bg-bubble: 244 244 244;
+  --bg-composer: 255 255 255;
+  --bg-inverse: 13 13 13;
+  --fg: 13 13 13;
+  --fg-muted: 93 93 93;
+  --fg-faint: 143 143 143;
+  --fg-on-inverse: 255 255 255;
+  --line: 0 0 0;
+  --accent: 33 111 237;
+  --ok: 22 150 84;
+  --warn: 196 120 10;
+  --bad: 220 58 58;
+  --info: 33 111 237;
+  --scrollbar: 0 0 0;
+  color-scheme: light;
+}
+
+.dark {
+  --bg-main: 33 33 33;
+  --bg-sidebar: 24 24 24;
+  --bg-elevated: 47 47 47;
+  --bg-subtle: 255 255 255;
+  --bg-bubble: 48 48 48;
+  --bg-composer: 48 48 48;
+  --bg-inverse: 255 255 255;
+  --fg: 236 236 236;
+  --fg-muted: 180 180 180;
+  --fg-faint: 128 128 128;
+  --fg-on-inverse: 13 13 13;
+  --line: 255 255 255;
+  --accent: 96 157 255;
+  --ok: 74 200 130;
+  --warn: 236 170 70;
+  --bad: 255 110 110;
+  --info: 96 157 255;
+  --scrollbar: 255 255 255;
+  color-scheme: dark;
+}

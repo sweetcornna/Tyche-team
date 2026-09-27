@@ -85,4 +85,14 @@ if [[ ! -d "$SITE/docs/en" ]]; then
   rm -rf "$DOCS_TMP"
   [[ -d "$SITE/docs/en" ]] || echo "[tyche] warning: could not fetch openjiuwen reference docs" >&2
 fi
+# The `tyche ui` web app ships as a prebuilt bundle in tyche/web/frontend/dist; build it when Node is available.
+if command -v npm >/dev/null; then
+  if npm --prefix tyche/web/frontend ci --no-audit --no-fund >/dev/null && npm --prefix tyche/web/frontend run build >/dev/null; then
+    echo "[tyche] built the web app (tyche ui)"
+  else
+    echo "[tyche] warning: could not build the web app; tyche ui will show build instructions" >&2
+  fi
+else
+  echo "[tyche] npm not found; skipped the web app build (tyche ui needs Node.js 20+ once)" >&2
+fi
 echo "[tyche] environment ready: source $VENV_DIR/bin/activate"

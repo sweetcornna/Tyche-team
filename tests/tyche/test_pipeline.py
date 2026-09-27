@@ -182,3 +182,40 @@ async def test_plan_stage_records_operator_notes(tmp_path):
             assert ws.latest("plan").inputs == [ws.latest("operator_notes").id]
         else:
             assert ws.latest("operator_notes") is None and ws.latest("plan").inputs == []
+
+
+def test_resume_from_stage_continues_and_keeps_operator_notes(tmp_path, monkeypatch):
+    import tyche.cli as cli
+    import tyche.pipeline as pipeline_module
+    from tyche import STAGES
+    from tyche.workspace import Workspace, write_json_atomic
+
+    root = tmp_path / "ws"
+    ws = Workspace.create(root, "r1", topic="topic A", direction="memory_engine", config_digest="x")
+    write_json_atomic(ws.run_dir / "config.json", cli._config(cli.build_parser().parse_args(["run"])).data)
+    ws.save_text("operator_notes", "Keep the history over budget.\n", stage="plan")
+    for stage in STAGES:
+        ws.mark_stage(stage, "done")
+    calls = []
+
+    class FakeHttp:
+        async def aclose(self):
+            return None
+
+    class FakePipeline:
+        def __init__(self, config, workspace, *args, operator_notes="", **kwargs):
+            self.notes = operator_notes
+
+        async def run(self, *, stop_after=None, only=None):
+            calls.append({"notes": self.notes, "stop_after": stop_after, "only": only})
+            return {}
+
+    monkeypatch.setattr(cli, "build_services", lambda config: (None, FakeHttp()))
+    monkeypatch.setattr(pipeline_module, "Pipeline", FakePipeline)
+    base = ["run", "--workspace", str(root), "--run-id", "r1", "--resume"]
+    assert cli.main([*base, "--from-stage", "write"]) == 0
+    assert calls[-1] == {"notes": "Keep the history over budget.\n", "stop_after": None, "only": None}
+    assert [Workspace.open(root, "r1").stage_status(s) for s in STAGES] == ["done"] * 4 + ["pending"] * 4
+    assert cli.main([*base, "--from-stage", "plan", "--stop-after", "plan", "--notes", "Use three baselines."]) == 0
+    assert calls[-1] == {"notes": "Use three baselines.", "stop_after": "plan", "only": None}
+    assert cli.main([*base, "--stage", "write", "--from-stage", "write"]) == 2

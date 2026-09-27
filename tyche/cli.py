@@ -82,7 +82,8 @@ async def _cmd_run(args: argparse.Namespace) -> int:
     config = _config(args)
     root = config.workspace_root()
     exists = bool(args.run_id) and (root / "runs" / str(args.run_id) / "state.json").exists()
-    if args.resume or (args.resume_if_exists and exists):
+    resumed = bool(args.resume or (args.resume_if_exists and exists))
+    if resumed:
         if not args.run_id:
             raise ConfigError("--resume needs --run-id")
         ws = Workspace.open(root, args.run_id)
@@ -96,8 +97,10 @@ async def _cmd_run(args: argparse.Namespace) -> int:
             _save_run_config(ws, config)
             ws.event("config.updated", digest=config.digest())
         services, http = build_services(config)
-        if args.stage:
-            ws.reset_from(args.stage)
+        if args.stage and args.from_stage:
+            raise ConfigError("use either --stage or --from-stage, not both")
+        if args.stage or args.from_stage:
+            ws.reset_from(args.stage or args.from_stage)
     else:
         if not args.topic or not args.direction:
             raise ConfigError("a new run needs --topic and --direction")
@@ -116,6 +119,9 @@ async def _cmd_run(args: argparse.Namespace) -> int:
     if args.notes:
         path = Path(args.notes)
         notes = path.read_text(encoding="utf-8") if path.exists() else args.notes
+    elif resumed and ws.latest("operator_notes") is not None:
+        # A resumed run that replans keeps the notes it was planned with.
+        notes = ws.load_text("operator_notes")
     memory = MemoryStore(root / "memory.db")
     skill_dir = Path(args.export_skill_dir).expanduser() if args.export_skill_dir else None
     pipeline = Pipeline(
@@ -287,6 +293,26 @@ async def _cmd_selftest(args: argparse.Namespace) -> int:
     return 0 if summary["ok"] else 1
 
 
+def _cmd_ui(args: argparse.Namespace) -> int:
+    from tyche.web.server import serve
+
+    config = _config(args)
+    root = config.workspace_root()
+    env_file = Path.cwd() / ".env"
+    url = f"http://{args.host}:{args.port}/"
+    print(f"[tyche] serving {url} (workspace {root})")
+    serve(
+        root,
+        host=args.host,
+        port=args.port,
+        config_path=args.config,
+        overrides=list(getattr(args, "set", None) or []),
+        env_file=env_file,
+        open_browser=not args.no_browser,
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="tyche", description="Evidence-bound ICLR short-paper agent on JiuwenSwarm")
     parser.add_argument("--version", action="version", version=f"tyche {__version__}")
@@ -312,6 +338,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--stage", choices=STAGES, help="with --resume: rerun exactly this stage and mark every later stage pending"
     )
+    run.add_argument(
+        "--from-stage",
+        choices=STAGES,
+        help="with --resume: rerun this stage and continue through every later stage (or --stop-after)",
+    )
     run.add_argument("--engine", choices=["openjiuwen", "imported", "fixture"], help="experiment engine")
     run.add_argument("--results-dir", help="with --engine imported: directory of <variant>.metrics.json files")
     run.add_argument("--notes", help="operator notes (text or a file path) for the planner")
@@ -336,6 +367,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     selftest = sub.add_parser("selftest", help="offline end-to-end test with scripted models and fixtures")
     selftest.add_argument("--keep", help="copy the selftest PDF and report to this directory")
+
+    ui = sub.add_parser("ui", help="serve the local web UI (runs, stages, events, artifacts, papers)")
+    common(ui)
+    ui.add_argument("--host", default="127.0.0.1", help="bind address (default 127.0.0.1)")
+    ui.add_argument("--port", type=int, default=8765, help="bind port (default 8765)")
+    ui.add_argument("--no-browser", action="store_true", help="do not open a browser tab")
     return parser
 
 
@@ -355,6 +392,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_lessons(args)
         if args.command == "selftest":
             return asyncio.run(_cmd_selftest(args))
+        if args.command == "ui":
+            return _cmd_ui(args)
     except (ConfigError, StageError, LLMError) as exc:
         print(f"[tyche] error: {exc}", file=sys.stderr)
         return 2

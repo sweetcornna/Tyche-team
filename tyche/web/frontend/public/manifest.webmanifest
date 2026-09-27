@@ -1,0 +1,11 @@
+{
+  "name": "Tyche Research",
+  "short_name": "Tyche",
+  "description": "Evidence-bound research agent that turns a question into a verified ICLR short paper.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#f9f9f9",
+  "icons": [{ "src": "/tyche.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }]
+}

@@ -710,6 +710,21 @@ def test_full_run_detail_paper_and_analysis(tmp_path):
     assert packaged["stats"] == claims["stats"]
     assert "Claim-evidence map" in report.text
 
+    # Agent sessions: one summary per transcript, and each transcript as display items.
+    sessions = client.get("/api/runs/full-run/agents").json()["sessions"]
+    by_name = {(s["stage"], s["name"]): s for s in sessions}
+    author = by_name[("write", "author")]
+    assert author["turns"] >= 8 and author["tool_calls"] >= 8 and author["handbacks"] == 1
+    assert ("plan", "planner") in by_name and ("review", "round1_rigor") in by_name
+    items = client.get("/api/runs/full-run/agents/write/author").json()["items"]
+    assert items[0]["kind"] == "task" and "Write the complete paper" in items[0]["text"]
+    first = next(i for i in items if i["kind"] == "assistant")
+    assert [c["tool"] for c in first["calls"]] == ["update_todos", "write_section"]
+    assert first["calls"][1]["args"]["section"] == "method" and "<call" not in first["prose"]
+    assert any(i["kind"] == "stop_blocked" for i in items)
+    assert client.get("/api/runs/full-run/agents/write/..%2Fstate").status_code == 404
+    assert client.get("/api/runs/full-run/agents/package/author").status_code == 404
+
 
 def test_trace_endpoints_before_a_paper_exists(tmp_path):
     Workspace.create(tmp_path, "run-early", topic="t", direction="memory_engine", config_digest="x")

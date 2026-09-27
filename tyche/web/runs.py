@@ -12,6 +12,7 @@ Reads only. Writes UI metadata (title override, pinned, archived) to
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -789,6 +790,94 @@ def report_text(run_dir: Path) -> str | None:
     if not path.exists():
         return None
     return path.read_text(encoding="utf-8")
+
+
+# -- agent sessions ------------------------------------------------------------
+
+AGENT_STAGES = ("plan", "write", "review")
+_CALL_BLOCK = re.compile(r"<call\s+(?:tool|name)\s*=\s*[\"'][\w.:-]+[\"']\s*(?:/>|>.*?</call>)", re.S)
+
+
+def _transcript_rows(path: Path) -> list[dict[str, Any]]:
+    rows = []
+    for line in complete_lines(path):
+        if line.strip():
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return rows
+
+
+def _clip(text: str, limit: int) -> str:
+    text = text or ""
+    return text if len(text) <= limit else text[:limit] + f"\n... ({len(text) - limit} more characters)"
+
+
+def agent_sessions(run_dir: Path) -> dict[str, Any]:
+    """One summary per agent session transcript of a run (plan, write, and review stages)."""
+    sessions = []
+    for stage in AGENT_STAGES:
+        folder = run_dir / stage / "agents" / "transcripts"
+        if not folder.is_dir():
+            continue
+        for path in sorted(folder.glob("*.jsonl"), key=lambda p: p.stat().st_mtime):
+            rows = _transcript_rows(path)
+            if not rows:
+                continue
+            results = [r for r in rows if r.get("kind") == "result"]
+            sessions.append(
+                {
+                    "stage": stage,
+                    "name": path.stem,
+                    "session": rows[0].get("session", path.stem),
+                    "tasks": sum(1 for r in rows if r.get("kind") == "task"),
+                    "turns": sum(1 for r in rows if r.get("kind") == "assistant"),
+                    "tool_calls": len(results),
+                    "tool_errors": sum(1 for r in results if not r.get("ok")),
+                    "handbacks": sum(1 for r in rows if r.get("kind") == "stop_blocked"),
+                    "compactions": sum(1 for r in rows if r.get("kind") == "compact"),
+                    "started": rows[0].get("at"),
+                    "ended": rows[-1].get("at"),
+                }
+            )
+    return {"sessions": sessions}
+
+
+def agent_transcript(run_dir: Path, stage: str, name: str, *, max_text: int = 20000) -> dict[str, Any] | None:
+    """A session's transcript as display items: tasks, the agent's prose and calls, results, hand-backs."""
+    from tyche.agent.tools import ProtocolError, parse_calls
+
+    if stage not in AGENT_STAGES or not re.fullmatch(r"[\w.-]+", name):
+        return None
+    path = run_dir / stage / "agents" / "transcripts" / f"{name}.jsonl"
+    if not path.is_file():
+        return None
+    items = []
+    for row in _transcript_rows(path):
+        kind = row.get("kind")
+        item: dict[str, Any] = {"kind": kind, "at": row.get("at"), "turn": row.get("turn")}
+        if kind == "assistant":
+            text = row.get("text", "")
+            try:
+                calls = parse_calls(text)
+            except ProtocolError:
+                calls = []
+            item["prose"] = _clip(_CALL_BLOCK.sub("", text).strip(), max_text)
+            item["calls"] = [
+                {"tool": c.tool, "args": {k: _clip(v, max_text) for k, v in c.raw_args.items()}} for c in calls
+            ]
+            item["error"] = row.get("error")
+        elif kind == "result":
+            item.update(tool=row.get("tool"), ok=bool(row.get("ok")), text=_clip(row.get("text", ""), max_text))
+        elif kind == "stop_blocked":
+            item["text"] = _clip(row.get("reason", ""), max_text)
+        elif kind == "compact":
+            item.update(text=_clip(row.get("summary", ""), max_text), tokens_before=row.get("tokens_before"))
+        else:
+            item["text"] = _clip(row.get("text", ""), max_text)
+        items.append(item)
+    return {"stage": stage, "name": name, "items": items}
 
 
 def log_tail(workspace_root: Path, run_id: str, *, tail: int = 400) -> dict[str, Any]:

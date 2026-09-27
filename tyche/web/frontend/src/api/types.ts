@@ -464,3 +464,30 @@ export interface NewRunRequest {
   };
   settings: { review_max_rounds: number | null; max_main_pages: number | null };
 }
+
+export interface AgentSessionSummary {
+  stage: "plan" | "write" | "review";
+  name: string;
+  session: string;
+  tasks: number;
+  turns: number;
+  tool_calls: number;
+  tool_errors: number;
+  handbacks: number;
+  compactions: number;
+  started: number;
+  ended: number;
+}
+
+export interface AgentItem {
+  kind: "task" | "assistant" | "result" | "stop_blocked" | "compact";
+  at?: number;
+  turn?: number;
+  text?: string;
+  prose?: string;
+  calls?: { tool: string; args: Record<string, string> }[];
+  error?: string | null;
+  tool?: string;
+  ok?: boolean;
+  tokens_before?: number;
+}

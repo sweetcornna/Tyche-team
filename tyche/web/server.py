@@ -553,6 +553,17 @@ def _register_routes(app: FastAPI, state: AppState) -> None:
             raise ApiError(404, "no_environment", "the environment is recorded when the paper is packaged")
         return read_json(path)
 
+    @app.get("/api/runs/{run_id}/agents")
+    def get_agents(run_id: str) -> dict[str, Any]:
+        return web_runs.agent_sessions(_require_run_dir(state, run_id))
+
+    @app.get("/api/runs/{run_id}/agents/{stage}/{name}")
+    def get_agent_transcript(run_id: str, stage: str, name: str) -> dict[str, Any]:
+        transcript = web_runs.agent_transcript(_require_run_dir(state, run_id), stage, name)
+        if transcript is None:
+            raise ApiError(404, "no_transcript", f"no agent transcript {stage}/{name}")
+        return transcript
+
     @app.get("/api/runs/{run_id}/log")
     def get_log(run_id: str, tail: int = 400) -> dict[str, Any]:
         _require_run_dir(state, run_id)

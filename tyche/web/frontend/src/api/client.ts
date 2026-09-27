@@ -1,4 +1,6 @@
 import type {
+  AgentItem,
+  AgentSessionSummary,
   Analysis,
   ArtifactInfo,
   ClaimMap,
@@ -88,6 +90,9 @@ export const api = {
   claims: (id: string) => request<ClaimMap>(`${run(id)}/claims`),
   revisions: (id: string) => request<{ rounds: RevisionRound[] }>(`${run(id)}/revisions`),
   lineage: (id: string) => request<LineageGraph>(`${run(id)}/lineage`),
+  agents: (id: string) => request<{ sessions: AgentSessionSummary[] }>(`${run(id)}/agents`).then((r) => r.sessions),
+  agentTranscript: (id: string, stage: string, name: string) =>
+    request<{ stage: string; name: string; items: AgentItem[] }>(`${run(id)}/agents/${enc(stage)}/${enc(name)}`),
   environment: (id: string) => request<Record<string, unknown>>(`${run(id)}/environment`),
   create: (body: NewRunRequest) =>
     request<{ run_id: string; process: ProcessInfo }>("/api/runs", { method: "POST", body: JSON.stringify(body) }),

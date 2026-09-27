@@ -16,6 +16,7 @@ export const PANEL_TABS = [
   "claims",
   "revisions",
   "lineage",
+  "agents",
   "report",
   "files",
   "log",
@@ -28,6 +29,7 @@ const ExperimentsTab = lazy(() => import("./ExperimentsTab"));
 const ResultsReviewTabs = lazy(() => import("./ResultsReviewTabs"));
 const TraceTabs = lazy(() => import("./TraceTabs"));
 const FilesTab = lazy(() => import("./FilesTab"));
+const AgentsTab = lazy(() => import("./AgentsTab"));
 
 export interface TabProps {
   runId: string;
@@ -117,6 +119,9 @@ export function RightPanel({
       break;
     case "files":
       body = <FilesTab {...props} />;
+      break;
+    case "agents":
+      body = <AgentsTab {...props} />;
       break;
   }
 

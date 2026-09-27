@@ -323,6 +323,8 @@ def test_desk_edits_are_sanitized_and_checked_at_once(tmp_path):
     fixed = edit(SimpleNamespace(section="experiments", old="(vs 0.77)", new="", replace_all=False))
     assert "0.77" not in composer.sections["experiments"] and "number 0.77" not in fixed.text
 
+    desk.write_section(SimpleNamespace(section="conclusion", latex="```latex\nWe conclude.\n```"))
+    assert composer.sections["conclusion"].strip() == "We conclude."
     assert "proposed.accuracy.mean = 0.8123" in desk.lookup_numbers(SimpleNamespace(query="proposed accuracy")).text
     assert "no registered value" in desk.lookup_numbers(SimpleNamespace(query="latency")).text
     assert not desk.set_title(SimpleNamespace(title=" ".join(["word"] * 20))).ok
@@ -330,7 +332,7 @@ def test_desk_edits_are_sanitized_and_checked_at_once(tmp_path):
     assert desk.title_set
     status = desk.status()
     assert "- method: not written" in status and "last build: none yet" in status
-    assert desk.missing() == ["method", "related_work", "introduction", "conclusion", "abstract"]
+    assert desk.missing() == ["method", "related_work", "introduction", "abstract"]
 
 
 async def test_desk_build_refuses_an_incomplete_paper(tmp_path):

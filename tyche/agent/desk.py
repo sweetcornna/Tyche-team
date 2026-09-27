@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from tyche.memory import MemoryStore
     from tyche.paper.compose import BuildResult, PaperComposer
 
+_FENCE = re.compile(r"```(?:latex|tex)?\s*\n(.*?)\n?```", re.S)
 SectionName = Literal["abstract", "introduction", "related_work", "method", "experiments", "analysis", "conclusion"]
 NO_CITATIONS = ("abstract", "conclusion")
 
@@ -165,6 +166,9 @@ class PaperDesk:
             self.log(event, **fields)
 
     def _store(self, name: str, text: str) -> ToolResult:
+        fenced = _FENCE.fullmatch(text.strip())
+        if fenced:
+            text = fenced.group(1)  # a model that wraps the whole section in a code fence
         body, report = sanitize_section(text, self.allowed_keys(name))
         if not body.strip():
             return ToolResult(f"refused: the {name} section would be empty", ok=False)

@@ -5,12 +5,30 @@ declare const process: { env: Record<string, string | undefined> };
 
 // `npm run dev` proxies the API to a running `tyche ui --no-browser` (default port 8765).
 const backend = process.env.TYCHE_UI_BACKEND ?? "http://127.0.0.1:8765";
+const devPort = 5178;
+const devOrigin = new RegExp(`^http://(localhost|127\\.0\\.0\\.1|\\[::1\\]):${devPort}$`);
+
+type ProxyRequest = { getHeader(name: string): unknown; setHeader(name: string, value: string): void };
+type ProxyEvents = { on(event: "proxyReq", listener: (req: ProxyRequest) => void): void };
 
 export default defineConfig({
   plugins: [react()],
   server: {
-    port: 5178,
-    proxy: { "/api": { target: backend, changeOrigin: false } },
+    port: devPort,
+    proxy: {
+      "/api": {
+        target: backend,
+        changeOrigin: false,
+        // Requests from the dev page itself carry the dev server's origin, which the API's Origin
+        // guard rejects; present them as the backend's own. Any other origin is passed through
+        // unchanged, so a cross-site page still cannot act through the dev server.
+        configure: (proxy) =>
+          (proxy as unknown as ProxyEvents).on("proxyReq", (req) => {
+            const origin = req.getHeader("origin");
+            if (typeof origin === "string" && devOrigin.test(origin)) req.setHeader("origin", backend);
+          }),
+      },
+    },
   },
   build: {
     outDir: "dist",

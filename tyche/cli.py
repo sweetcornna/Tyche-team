@@ -13,7 +13,7 @@ from typing import Any
 from tyche import STAGES, __version__
 from tyche.config import DIRECTIONS, ConfigError, TycheConfig, load_direction
 from tyche.llm import LLMError
-from tyche.workspace import StageError, Workspace, read_json, write_json_atomic
+from tyche.workspace import StageError, Workspace, check_run_id, read_json, write_json_atomic
 
 
 def _load_env_files() -> None:
@@ -21,8 +21,9 @@ def _load_env_files() -> None:
         from dotenv import load_dotenv
     except ImportError:  # pragma: no cover - python-dotenv ships with openjiuwen
         return
-    load_dotenv(Path.cwd() / ".env", override=False)
-    load_dotenv(Path.home() / ".jiuwenswarm" / "config" / ".env", override=False)
+    # Values are literal: no ${VAR} interpolation can copy one secret into another setting.
+    load_dotenv(Path.cwd() / ".env", override=False, interpolate=False)
+    load_dotenv(Path.home() / ".jiuwenswarm" / "config" / ".env", override=False, interpolate=False)
 
 
 def _config(args: argparse.Namespace, base: dict[str, Any] | None = None) -> TycheConfig:
@@ -75,6 +76,24 @@ def _save_run_config(ws: Workspace, config: TycheConfig) -> None:
     write_json_atomic(ws.run_dir / "config.json", config.data)
 
 
+def _lock_run(root: Path, run_id: str) -> Any:
+    """Hold an exclusive lock on one run for the life of this process, so two writers never share it."""
+    check_run_id(run_id)
+    lock_dir = root / ".locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    handle = (lock_dir / f"{run_id}.lock").open("a+")
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - Windows has no flock; the web UI still serializes its launches
+        return handle
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        raise ConfigError(f"run {run_id!r} is already running in another process") from None
+    return handle
+
+
 async def _cmd_run(args: argparse.Namespace) -> int:
     from tyche.memory import MemoryStore
     from tyche.pipeline import Pipeline
@@ -86,6 +105,7 @@ async def _cmd_run(args: argparse.Namespace) -> int:
     if resumed:
         if not args.run_id:
             raise ConfigError("--resume needs --run-id")
+        _run_lock = _lock_run(root, args.run_id)  # held until this run ends
         ws = Workspace.open(root, args.run_id)
         topic, direction = ws.state["topic"], ws.state["direction"]
         if (args.topic and args.topic != topic) or (args.direction and args.direction != direction):
@@ -111,6 +131,7 @@ async def _cmd_run(args: argparse.Namespace) -> int:
         run_id = args.run_id or f"{datetime.now(timezone.utc):%Y%m%d-%H%M%S}-{slugify(args.topic, 32)}"
         topic, direction = args.topic, args.direction
         load_direction(direction)
+        _run_lock = _lock_run(root, run_id)  # held until this run ends
         # Build services first so missing credentials fail before an empty run directory is created.
         services, http = build_services(config)
         ws = Workspace.create(root, run_id, topic=topic, direction=direction, config_digest=config.digest())
@@ -296,10 +317,22 @@ async def _cmd_selftest(args: argparse.Namespace) -> int:
 def _cmd_ui(args: argparse.Namespace) -> int:
     from tyche.web.server import serve
 
+    import secrets
+
+    from tyche.web.server import LOOPBACK_HOSTS
+
     config = _config(args)
     root = config.workspace_root()
     env_file = Path.cwd() / ".env"
-    url = f"http://{args.host}:{args.port}/"
+    token = None
+    if args.host.strip("[]") not in LOOPBACK_HOSTS:
+        if not args.allow_remote:
+            raise ConfigError(
+                f"--host {args.host} would let other machines start, stop and delete runs; pass --allow-remote "
+                "to serve beyond this machine behind a per-launch access token"
+            )
+        token = secrets.token_urlsafe(24)
+    url = f"http://{args.host}:{args.port}/" + (f"?token={token}" if token else "")
     print(f"[tyche] serving {url} (workspace {root})")
     serve(
         root,
@@ -309,6 +342,7 @@ def _cmd_ui(args: argparse.Namespace) -> int:
         overrides=list(getattr(args, "set", None) or []),
         env_file=env_file,
         open_browser=not args.no_browser,
+        token=token,
     )
     return 0
 
@@ -372,6 +406,11 @@ def build_parser() -> argparse.ArgumentParser:
     common(ui)
     ui.add_argument("--host", default="127.0.0.1", help="bind address (default 127.0.0.1)")
     ui.add_argument("--port", type=int, default=8765, help="bind port (default 8765)")
+    ui.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="allow a non-loopback --host; access then requires the token in the printed URL",
+    )
     ui.add_argument("--no-browser", action="store_true", help="do not open a browser tab")
     return parser
 

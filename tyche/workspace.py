@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import tempfile
 from dataclasses import asdict, dataclass, field
@@ -67,6 +68,34 @@ def read_json(path: Path, default: Any = None) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def complete_lines(path: Path) -> list[str]:
+    """The newline-terminated lines of a file another process may be appending to.
+
+    A last line without its newline is still being written and is left for the next read.
+    Lines end only at ``\n``: ``str.splitlines`` would also split at U+2028 inside JSON.
+    """
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    return text.split("\n")[:-1]
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    """Complete JSON-object lines of a JSONL file; blank and unreadable lines are skipped."""
+    rows = []
+    for line in complete_lines(path):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict):
+            rows.append(row)
+    return rows
+
+
 @dataclass
 class ArtifactRecord:
     id: str
@@ -86,6 +115,15 @@ class StageError(RuntimeError):
     """A stage could not produce valid outputs; the run stops loudly."""
 
 
+RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+
+
+def check_run_id(run_id: str) -> None:
+    """A run id names one directory under ``runs/``; it may never be a path."""
+    if not RUN_ID_PATTERN.fullmatch(str(run_id)):
+        raise StageError(f"invalid run id {run_id!r}: use letters, digits, '.', '_' and '-' (not starting with '.')")
+
+
 class Workspace:
     def __init__(self, root: Path, run_id: str):
         self.root = Path(root)
@@ -98,6 +136,7 @@ class Workspace:
     # -- lifecycle -----------------------------------------------------
     @classmethod
     def create(cls, root: Path, run_id: str, *, topic: str, direction: str, config_digest: str) -> "Workspace":
+        check_run_id(run_id)
         ws = cls(root, run_id)
         if ws.state_path.exists():
             raise StageError(f"run {run_id!r} already exists at {ws.run_dir}; use --resume")
@@ -120,6 +159,7 @@ class Workspace:
 
     @classmethod
     def open(cls, root: Path, run_id: str) -> "Workspace":
+        check_run_id(run_id)
         ws = cls(root, run_id)
         if not ws.state_path.exists():
             raise StageError(f"no run named {run_id!r} under {root}")

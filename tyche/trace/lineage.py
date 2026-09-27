@@ -14,26 +14,12 @@ from pathlib import Path
 from typing import Any
 
 from tyche import STAGES
+from tyche.workspace import read_jsonl
 
 
 def read_provenance(run_dir: Path) -> list[dict[str, Any]]:
     """Provenance rows of a run in write order; unreadable lines are skipped."""
-    path = Path(run_dir) / "provenance.jsonl"
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        return []
-    rows = []
-    for line in text.splitlines():
-        if not line.strip():
-            continue
-        try:
-            row = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(row, dict) and row.get("id") and row.get("name"):
-            rows.append(row)
-    return rows
+    return [row for row in read_jsonl(Path(run_dir) / "provenance.jsonl") if row.get("id") and row.get("name")]
 
 
 def load_json(path: Path) -> Any:

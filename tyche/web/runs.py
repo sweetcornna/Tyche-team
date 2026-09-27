@@ -17,7 +17,8 @@ from pathlib import Path
 from typing import Any
 
 from tyche import STAGES
-from tyche.workspace import read_json, write_json_atomic
+from tyche.trace.lineage import read_provenance
+from tyche.workspace import complete_lines, read_json, read_jsonl, write_json_atomic
 
 UI_META_PATH = Path(".tyche-web") / "runs.json"
 _TRASH_DIR = ".tyche-web/trash"
@@ -100,14 +101,7 @@ def drop_ui_meta(workspace_root: Path, run_id: str) -> None:
 
 
 def _provenance(run_dir: Path) -> list[dict[str, Any]]:
-    path = run_dir / "provenance.jsonl"
-    if not path.exists():
-        return []
-    out = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if line.strip():
-            out.append(json.loads(line))
-    return out
+    return read_provenance(run_dir)
 
 
 def latest_artifact(run_dir: Path, name: str) -> dict[str, Any] | None:
@@ -315,13 +309,7 @@ def _stage_error_from_events(run_dir: Path, stage: str) -> str | None:
     if not path.exists():
         return None
     found = None
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        try:
-            ev = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+    for ev in read_jsonl(path):
         if ev.get("kind") == "stage.failed" and ev.get("stage") == stage:
             found = ev.get("error") or ev.get("message")
     return found
@@ -370,9 +358,12 @@ def usage_summary(run_dir: Path) -> dict[str, Any] | None:
     from tyche.llm import UsageMeter, UsageRecord
 
     meter = UsageMeter()
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if line.strip():
-            meter.records.append(UsageRecord(**json.loads(line)))
+    fields = set(UsageRecord.__dataclass_fields__)
+    for row in read_jsonl(path):
+        try:
+            meter.records.append(UsageRecord(**{k: v for k, v in row.items() if k in fields}))
+        except TypeError:
+            continue
     summary = meter.summary()
     by_model: dict[str, dict[str, int]] = {}
     for rec in meter.records:
@@ -469,7 +460,8 @@ def events_page(run_dir: Path, *, since: int = 0, limit: int = 500) -> dict[str,
     path = run_dir / "events.jsonl"
     if not path.exists():
         return {"events": [], "next": since}
-    lines = path.read_text(encoding="utf-8").splitlines()
+    # Only complete lines get a sequence number, so a line still being written is sent next time.
+    lines = complete_lines(path)
     end = min(len(lines), since + max(0, limit))
     events = []
     for seq in range(max(0, since), end):
@@ -488,7 +480,7 @@ def event_line_count(run_dir: Path) -> int:
     path = run_dir / "events.jsonl"
     if not path.exists():
         return 0
-    return len(path.read_text(encoding="utf-8").splitlines())
+    return len(complete_lines(path))
 
 
 # -- references -----------------------------------------------------------
@@ -570,14 +562,7 @@ def _manager_events(attempt_dir: Path) -> list[dict[str, Any]]:
     path = attempt_dir / "manager" / "events.jsonl"
     if not path.exists():
         return []
-    out = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if line.strip():
-            try:
-                out.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-    return out
+    return read_jsonl(path)
 
 
 def _attempt_terminal(attempt_dir: Path) -> bool:
@@ -596,14 +581,7 @@ def _newest_trace(attempt_dir: Path) -> Path | None:
 
 
 def _trace_events(path: Path) -> list[dict[str, Any]]:
-    out = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if line.strip():
-            try:
-                out.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-    return out
+    return read_jsonl(path)
 
 
 def _open_subagent(attempt_dir: Path) -> dict[str, Any] | None:

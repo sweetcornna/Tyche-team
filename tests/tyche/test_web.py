@@ -404,6 +404,24 @@ def test_post_runs_validation_errors(tmp_path):
     assert bad_pages.json()["error"]["code"] == "invalid_max_main_pages"
 
 
+def test_run_requests_cannot_smuggle_settings_or_paths(tmp_path):
+    launcher = FakeLauncher()
+    client = _client(tmp_path, launcher=launcher)
+    base = {"topic": "A fine research topic", "direction": "memory_engine"}
+    for name in ("${API_KEY}", "m #x", "a b", "{x}", "m\n"):
+        resp = client.post("/api/runs", json={**base, "model": {"model_name": name}})
+        assert resp.status_code == 422 and resp.json()["error"]["code"] == "invalid_model_name", name
+    bad_reviewer = client.post("/api/runs", json={**base, "model": {"reviewer_model": "$HOME"}})
+    assert bad_reviewer.json()["error"]["code"] == "invalid_reviewer_model"
+    assert client.post("/api/runs", json={**base, "run_id": "my-run\n"}).status_code == 422
+    assert not launcher.spawned
+    # A topic that looks like a flag stays the topic.
+    assert client.post("/api/runs", json={**base, "topic": "--stop-after plan"}).status_code == 202
+    assert "--topic=--stop-after plan" in launcher.spawned[0]["argv"]
+    for run_id in ("..", ".hidden", "a%2Fb"):
+        assert client.get(f"/api/runs/{run_id}").status_code == 404
+
+
 def test_post_runs_launch_with_fake_launcher(tmp_path):
     launcher = FakeLauncher()
     client = _client(tmp_path, launcher=launcher)
@@ -425,7 +443,8 @@ def test_post_runs_launch_with_fake_launcher(tmp_path):
     assert launcher.spawned[0]["run_id"] == "my-run-1"
     assert str(tmp_path) in argv
     assert "--run-id" in argv and "my-run-1" in argv
-    assert "--set" in argv and "models.default.model_name=gpt-6-luna" in argv
+    assert "--set" in argv and 'models.default.model_name="gpt-6-luna"' in argv
+    assert "--topic=A fine research topic" in argv
     assert any("review.max_rounds=2" in a for a in argv)
     assert any("paper.max_main_pages=4" in a for a in argv)
     assert "--notes" in argv
@@ -519,24 +538,50 @@ def test_settings_env_write_preserves_lines_and_hides_secrets(tmp_path):
     text = env_path.read_text(encoding="utf-8")
     assert "# a comment" in text
     assert "UNRELATED_KEY=keep-me" in text
-    assert "API_KEY=brand-new-secret" in text
-    assert "MODEL_NAME=new-model" in text
+    assert "API_KEY='brand-new-secret'" in text
+    assert "MODEL_NAME='new-model'" in text
 
     unknown = client.put("/api/settings/env", json={"values": {"NOT_A_REAL_KEY": "x"}})
     assert unknown.status_code == 422
 
     newline = client.put("/api/settings/env", json={"secrets": {"API_KEY": "line1\nline2"}})
     assert newline.status_code == 422
+    # A reference to another variable would copy that secret into a logged setting.
+    for value in ("${API_KEY}", "a'b", "a\\b", "`id`"):
+        assert client.put("/api/settings/env", json={"values": {"API_BASE": value}}).status_code == 422
+
+
+def test_env_values_are_read_back_literally(tmp_path, monkeypatch):
+    from dotenv import dotenv_values
+
+    env_path = tmp_path / "lit.env"
+    env_path.write_text("API_KEY=sk-test-secret\n", encoding="utf-8")
+    apply_env_updates(env_path, values={"API_BASE": "https://example.test/v1#frag", "MODEL_NAME": "m # x"})
+    assert dotenv_values(env_path, interpolate=False) == {
+        "API_KEY": "sk-test-secret", "API_BASE": "https://example.test/v1#frag", "MODEL_NAME": "m # x"
+    }
+    # A hand-written reference stays literal when the server reloads the file.
+    env_path.write_text("API_KEY=sk-test-secret\nAPI_BASE=https://h/${API_KEY}\n", encoding="utf-8")
+    monkeypatch.delenv("API_BASE", raising=False)
+    from tyche.web.server import _reload_env
+
+    _reload_env(env_path)
+    import os
+
+    assert os.environ["API_BASE"] == "https://h/${API_KEY}"
 
 
 def test_apply_env_updates_creates_file_atomically(tmp_path):
     env_path = tmp_path / "fresh.env"
     updates = apply_env_updates(env_path, values={"API_BASE": "https://example.test/v1"})
     assert updates == {"API_BASE": "https://example.test/v1"}
-    assert env_path.read_text(encoding="utf-8").strip() == "API_BASE=https://example.test/v1"
+    assert env_path.read_text(encoding="utf-8").strip() == "API_BASE='https://example.test/v1'"
     assert (env_path.stat().st_mode & 0o777) == 0o600
     with pytest.raises(SettingsError):
         apply_env_updates(env_path, values={"NOT_ALLOWED": "x"})
+    env_path.write_text("MODEL_NAME=a\n# keep\nMODEL_NAME=b\n", encoding="utf-8")
+    apply_env_updates(env_path, values={"MODEL_NAME": "c"})
+    assert env_path.read_text(encoding="utf-8") == "MODEL_NAME='c'\n# keep\n"
 
 
 # -- Host/Origin guard ---------------------------------------------------------
@@ -691,6 +736,77 @@ def test_resume_from_stage_with_notes_builds_argv(tmp_path):
     both = client.post("/api/runs/run-again/resume", json={"stage": "write", "from_stage": "write"})
     assert both.status_code == 422
     assert client.post("/api/runs/run-again/resume", json={"from_stage": "nope"}).status_code == 422
+    # Notes steer planning only; sent with a later stage they would be silently ignored.
+    late = client.post("/api/runs/run-again/resume", json={"from_stage": "write", "notes": "x"})
+    assert late.status_code == 422 and late.json()["error"]["code"] == "notes_need_replan"
+
+
+def test_resume_keeps_the_run_config_instead_of_the_servers(tmp_path):
+    Workspace.create(tmp_path, "run-own", topic="t", direction="memory_engine", config_digest="x")
+    launcher = FakeLauncher()
+    app = create_app(tmp_path, static_dir=_MISSING_STATIC, launcher=launcher, overrides=["review.max_rounds=9"])
+    client = TestClient(app, base_url="http://127.0.0.1")
+    assert client.post("/api/runs/run-own/resume", json={}).status_code == 202
+    assert "review.max_rounds=9" not in launcher.spawned[-1]["argv"]
+    assert client.post("/api/runs", json={"topic": "A new topic", "direction": "memory_engine"}).status_code == 202
+    assert "review.max_rounds=9" in launcher.spawned[-1]["argv"]
+
+
+def test_cli_process_detection_reads_every_run_id_form(tmp_path):
+    from tyche.web.processes import _matches_run, _run_of
+
+    py = ["/usr/bin/python3", "-m", "tyche", "run"]
+    assert _run_of([*py, "--run-id", "a1"]) == ("a1", None)
+    assert _run_of([*py, "--run-id=a1"]) == ("a1", None)
+    assert _run_of([*py, "--run", "a1", "--resume"]) == ("a1", None)
+    assert _run_of([*py, "--resume"]) is None
+    assert _run_of(["/usr/bin/python3", "other.py", "run", "--run-id", "a1"]) is None
+    assert _run_of([*py, "--workspace=/w", "--run-id", "a1"]) == ("a1", "/w")
+    here = [*py, "--run-id", "a1", "--workspace", str(tmp_path)]
+    assert _matches_run(here, "a1", tmp_path)
+    assert not _matches_run([*py, "--run-id", "a1", "--workspace", str(tmp_path / "elsewhere")], "a1", tmp_path)
+    assert _matches_run([*py, "--run-id", "a1", "--workspace", "ws"], "a1", tmp_path / "ws", cwd=str(tmp_path))
+    assert _matches_run([*py, "--run-id", "a1"], "a1", tmp_path)  # workspace from config: cannot tell, assume same
+
+
+def test_stop_ends_children_that_left_the_process_group(tmp_path, monkeypatch):
+    import subprocess
+    import sys
+    import time
+
+    import psutil
+
+    from tyche.web import processes
+    from tyche.web.processes import Launcher, ProcessRegistry
+
+    monkeypatch.setattr(processes, "_STOP_WAIT_S", 2.0)
+    child_pid = tmp_path / "child.pid"
+    script = (
+        "import subprocess, sys, time\n"
+        "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], start_new_session=True)\n"
+        f"open({str(child_pid)!r}, 'w').write(str(c.pid))\n"
+        "time.sleep(60)\n"
+    )
+    parent = subprocess.Popen([sys.executable, "-c", script])
+    try:
+        for _ in range(100):
+            if child_pid.exists() and child_pid.read_text():
+                break
+            time.sleep(0.05)
+        child = psutil.Process(int(child_pid.read_text()))
+        launcher = Launcher(ProcessRegistry(tmp_path))
+        launcher.stop("r1", {"pid": parent.pid, "source": "cli"})
+        for thread in launcher._threads:
+            thread.join(timeout=10)
+        parent.wait(timeout=5)
+        assert not child.is_running() or child.status() == psutil.STATUS_ZOMBIE
+    finally:
+        for pid in (parent.pid, int(child_pid.read_text() or 0) if child_pid.exists() else 0):
+            try:
+                if pid:
+                    psutil.Process(pid).kill()
+            except psutil.NoSuchProcess:
+                pass
 
 
 def test_sse_frames_are_well_formed():
@@ -699,11 +815,77 @@ def test_sse_frames_are_well_formed():
     async def items():
         yield {"event": "summary", "data": '{"a": 1}'}
         yield {"event": "ping", "data": "line one\nline two"}
+        yield {"event": "event", "data": json.dumps({"text": "a\u2028b\u0085c"}, ensure_ascii=False)}
 
     async def collect():
         return [frame async for frame in sse_lines(items())]
 
-    assert asyncio.run(collect()) == [
+    frames = asyncio.run(collect())
+    assert frames[2] == 'event: event\ndata: {"text": "a\u2028b\u0085c"}\n\n'
+    assert frames[:2] == [
         'event: summary\ndata: {"a": 1}\n\n',
         "event: ping\ndata: line one\ndata: line two\n\n",
     ]
+
+
+def test_remote_binding_requires_the_launch_token(tmp_path):
+    with pytest.raises(ValueError):
+        create_app(tmp_path, static_dir=_MISSING_STATIC, host="0.0.0.0")
+    app = create_app(tmp_path, static_dir=_MISSING_STATIC, launcher=FakeLauncher(), host="0.0.0.0", token="tok-123")
+    client = TestClient(app, base_url="http://192.168.5.20:8765")
+    assert client.get("/api/meta").status_code == 401
+    assert client.get("/api/meta", params={"token": "wrong"}).status_code == 401
+    hop = client.get("/", params={"token": "tok-123"}, follow_redirects=False)
+    assert hop.status_code == 303 and "token=" not in hop.headers["location"]
+    cookie = hop.headers["set-cookie"].lower()
+    assert "httponly" in cookie and "samesite=strict" in cookie
+    assert client.get("/api/meta").status_code == 200  # the cookie now authorizes the session
+    other = TestClient(app, base_url="http://192.168.5.20:8765")
+    assert other.get("/api/meta", headers={"Authorization": "Bearer tok-123"}).status_code == 200
+    cross = client.post(
+        "/api/runs", json={"topic": "A topic", "direction": "memory_engine"}, headers={"Origin": "http://evil.test"}
+    )
+    assert cross.status_code == 403
+
+
+def test_ui_refuses_a_remote_host_without_opt_in(tmp_path, monkeypatch):
+    from tyche.cli import _cmd_ui, build_parser
+    from tyche.config import ConfigError
+
+    served = {}
+    monkeypatch.setattr("tyche.web.server.serve", lambda root, **kw: served.update(kw))
+    args = build_parser().parse_args(["ui", "--workspace", str(tmp_path), "--host", "0.0.0.0", "--no-browser"])
+    with pytest.raises(ConfigError, match="--allow-remote"):
+        _cmd_ui(args)
+    args = build_parser().parse_args(
+        ["ui", "--workspace", str(tmp_path), "--host", "0.0.0.0", "--no-browser", "--allow-remote"]
+    )
+    _cmd_ui(args)
+    assert served["host"] == "0.0.0.0" and len(served["token"]) >= 24
+    _cmd_ui(build_parser().parse_args(["ui", "--workspace", str(tmp_path), "--no-browser"]))
+    assert served["token"] is None
+
+
+def test_readers_wait_for_a_line_that_is_still_being_written(tmp_path):
+    from tyche.web import runs as web_runs
+
+    ws = Workspace.create(tmp_path, "run-live", topic="t", direction="memory_engine", config_digest="x")
+    run_dir = ws.run_dir
+    events = run_dir / "events.jsonl"
+    before = web_runs.event_line_count(run_dir)
+    with events.open("a", encoding="utf-8") as handle:
+        # A writer with ensure_ascii=False puts U+2028 in the line itself; it does not end the line.
+        handle.write('{"kind": "note", "text": "a\u2028b"}\n{"kind": "stage.run')
+    page = web_runs.events_page(run_dir, since=before)
+    assert [e["kind"] for e in page["events"]] == ["note"] and page["next"] == before + 1
+    assert page["events"][0]["text"] == "a b"
+    with events.open("a", encoding="utf-8") as handle:
+        handle.write('ning", "stage": "plan"}\n')
+    later = web_runs.events_page(run_dir, since=page["next"])
+    assert [e["kind"] for e in later["events"]] == ["stage.running"]
+    with (run_dir / "provenance.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write('{"id": "x", "name": "pl')
+    with (run_dir / "usage.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write('{"purpose": "plan", "sta')
+    client = _client(tmp_path)
+    assert client.get("/api/runs/run-live").status_code == 200

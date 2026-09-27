@@ -10,6 +10,7 @@ gets returned; models are never asked anything here.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import io
 import json
 import os
@@ -17,6 +18,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import zipfile
 from dataclasses import dataclass, field
@@ -28,7 +30,14 @@ from urllib.parse import urlparse
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+    StreamingResponse,
+)
 from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -39,11 +48,14 @@ from tyche.trace import claim_map_for_run, lineage_graph, revision_history
 from tyche.web import runs as web_runs
 from tyche.web.processes import Launcher, LauncherProtocol, ProcessRegistry
 from tyche.web.settings import SECRET_KEYS, SettingsError, VALUE_KEYS, apply_env_updates, read_key_presence, read_values
-from tyche.workspace import read_json, sha256_file
+from tyche.workspace import RUN_ID_PATTERN, read_json, sha256_file
 
 REASONING_LEVELS = ("low", "medium", "high", "xhigh", "max")
 _ENGINES = ("openjiuwen", "imported", "fixture")
-_RUN_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{2,63}$")
+_RUN_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{2,63}")
+# Model identifiers reach the CLI as ``--set`` values, which are YAML-parsed and ``${VAR}``-expanded;
+# anything outside this set could read an environment variable into a logged setting.
+_MODEL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}")
 _BAD_MODEL_WORDS = ("image", "embedding", "tts", "whisper", "audio", "moderation")
 _NOT_BUILT_HTML = """<!doctype html>
 <html><head><meta charset="utf-8"><title>Tyche</title></head>
@@ -76,6 +88,13 @@ class AppState:
     host: str
     port: int
     models_cache: dict[str, tuple[float, dict[str, Any]]] = field(default_factory=dict)
+    _locks: dict[str, threading.Lock] = field(default_factory=dict)
+    _locks_guard: threading.Lock = field(default_factory=threading.Lock)
+
+    def run_lock(self, run_id: str) -> threading.Lock:
+        """Held while a request checks that a run is idle and then launches or deletes it."""
+        with self._locks_guard:
+            return self._locks.setdefault(run_id, threading.Lock())
 
 
 def _default_static_dir() -> Path:
@@ -89,7 +108,8 @@ def _reload_env(env_file: Path | None) -> None:
         from dotenv import load_dotenv
     except ImportError:  # pragma: no cover - python-dotenv ships with openjiuwen
         return
-    load_dotenv(env_file, override=True)
+    # No ${VAR} interpolation: a value is taken literally, never filled from another secret.
+    load_dotenv(env_file, override=True, interpolate=False)
 
 
 def build_config(state: AppState) -> TycheConfig:
@@ -101,6 +121,9 @@ def build_config(state: AppState) -> TycheConfig:
 
 
 def _require_run_dir(state: AppState, run_id: str) -> Path:
+    # Run ids from the CLI may use capitals, dots and underscores, but never a path.
+    if not RUN_ID_PATTERN.fullmatch(run_id):
+        raise ApiError(404, "run_not_found", f"no run named {run_id!r}")
     run_dir = web_runs.run_dir_of(state.workspace_root, run_id)
     if not (run_dir / "state.json").exists():
         raise ApiError(404, "run_not_found", f"no run named {run_id!r}")
@@ -193,26 +216,59 @@ class EnvSettingsBody(BaseModel):
 # -- security middleware ---------------------------------------------------
 
 
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+_TOKEN_COOKIE = "tyche_token"
+
+
+def _same(a: str, b: str) -> bool:
+    return hmac.compare_digest(a.encode("utf-8", "replace"), b.encode("utf-8", "replace"))
+
+
 class HostOriginGuard(BaseHTTPMiddleware):
     """Blocks DNS rebinding: rejects an unrecognized ``Host``, and (for state-changing requests)
-    an ``Origin`` that is not this server's own origin."""
+    an ``Origin`` that is not this server's own origin.
 
-    def __init__(self, app, *, allowed_host: str, port: int):
+    With a ``token`` (a server bound beyond loopback), every request must carry it instead: the
+    printed ``?token=`` URL is exchanged once for an HttpOnly, SameSite=Strict cookie, which a
+    rebinding or cross-site page never receives. Any ``Host`` is then accepted.
+    """
+
+    def __init__(self, app, *, allowed_host: str, port: int, token: str | None = None):
         super().__init__(app)
-        self.allowed_hosts = {"127.0.0.1", "localhost", "::1", allowed_host.strip("[]")}
+        self.allowed_hosts = {*LOOPBACK_HOSTS, allowed_host.strip("[]")}
         self.port = port
+        self.token = token
+
+    def _authorized(self, request: Request) -> bool:
+        assert self.token is not None
+        header = request.headers.get("authorization", "")
+        bearer = header[7:] if header.lower().startswith("bearer ") else ""
+        return _same(request.cookies.get(_TOKEN_COOKIE, ""), self.token) or _same(bearer, self.token)
 
     async def dispatch(self, request: Request, call_next):
         host_header = request.headers.get("host", "")
         hostname = host_header.rsplit(":", 1)[0].strip("[]") if host_header else ""
-        if hostname not in self.allowed_hosts:
+        allowed = set(self.allowed_hosts)
+        if self.token is not None:
+            supplied = request.query_params.get("token")
+            if supplied is not None and _same(supplied, self.token):
+                response = RedirectResponse(url=str(request.url.remove_query_params("token")), status_code=303)
+                response.set_cookie(_TOKEN_COOKIE, self.token, httponly=True, samesite="strict")
+                return response
+            if not self._authorized(request):
+                return JSONResponse(
+                    status_code=401,
+                    content={"error": {"code": "unauthorized", "message": "open the ?token= URL printed by tyche ui"}},
+                )
+            allowed.add(hostname)
+        elif hostname not in allowed:
             return JSONResponse(status_code=403, content={"error": {"code": "forbidden_host", "message": "host not allowed"}})
         if request.method not in ("GET", "HEAD", "OPTIONS"):
             origin = request.headers.get("origin")
             if origin:
                 parsed = urlparse(origin)
                 origin_host = (parsed.hostname or "").strip("[]")
-                if origin_host not in self.allowed_hosts or parsed.port != self.port:
+                if origin_host not in allowed or parsed.port != self.port:
                     return JSONResponse(
                         status_code=403, content={"error": {"code": "forbidden_origin", "message": "origin not allowed"}}
                     )
@@ -232,6 +288,7 @@ def create_app(
     launcher: LauncherProtocol | None = None,
     host: str = "127.0.0.1",
     port: int = 8765,
+    token: str | None = None,
 ) -> FastAPI:
     workspace_root = Path(workspace_root).expanduser().resolve()
     registry = ProcessRegistry(workspace_root)
@@ -250,7 +307,9 @@ def create_app(
     )
     app = FastAPI(title="Tyche", version=__version__)
     app.state.tyche = state
-    app.add_middleware(HostOriginGuard, allowed_host=host, port=port)
+    if token is None and host.strip("[]") not in LOOPBACK_HOSTS:
+        raise ValueError("a server bound beyond loopback needs an access token")
+    app.add_middleware(HostOriginGuard, allowed_host=host, port=port, token=token)
 
     @app.exception_handler(StarletteHTTPException)
     async def _http_error(request: Request, exc: StarletteHTTPException):
@@ -279,6 +338,7 @@ def serve(
     env_file: Path | None = None,
     static_dir: Path | None = None,
     open_browser: bool = True,
+    token: str | None = None,
 ) -> None:
     app = create_app(
         workspace_root,
@@ -288,11 +348,13 @@ def serve(
         static_dir=static_dir,
         host=host,
         port=port,
+        token=token,
     )
     if open_browser:
         import webbrowser
 
-        webbrowser.open(f"http://{host}:{port}/")
+        local = host if host.strip("[]") in LOOPBACK_HOSTS else "127.0.0.1"
+        webbrowser.open(f"http://{local}:{port}/" + (f"?token={token}" if token else ""))
     import uvicorn
 
     uvicorn.run(app, host=host, port=port, log_level="info")
@@ -341,7 +403,8 @@ def _register_routes(app: FastAPI, state: AppState) -> None:
         cache_key = writer.api_base
         now = time.monotonic()
         cached = state.models_cache.get(cache_key)
-        if cached is not None and now - cached[0] < 300:
+        # A model list is kept five minutes; a failed lookup only briefly, so a fixed key shows up soon.
+        if cached is not None and now - cached[0] < (30 if "error" in cached[1] else 300):
             return cached[1]
         api_key = writer.api_key()
         fallback = {
@@ -576,6 +639,10 @@ def _register_routes(app: FastAPI, state: AppState) -> None:
     @app.post("/api/runs/{run_id}/resume", status_code=202)
     def resume_run(run_id: str, body: ResumeBody) -> JSONResponse:
         _require_run_dir(state, run_id)
+        with state.run_lock(run_id):
+            return _resume_run(state, run_id, body)
+
+    def _resume_run(state: AppState, run_id: str, body: ResumeBody) -> JSONResponse:
         if state.registry.live_process(run_id) is not None:
             raise ApiError(409, "already_running", f"run {run_id!r} is already running")
         for name in ("stage", "from_stage", "stop_after"):
@@ -584,8 +651,11 @@ def _register_routes(app: FastAPI, state: AppState) -> None:
                 raise ApiError(422, "invalid_stage", f"{name} must be a known stage")
         if body.stage and body.from_stage:
             raise ApiError(422, "invalid_stage", "use either stage or from_stage, not both")
+        if body.notes is not None and body.notes.strip() and "plan" not in (body.stage, body.from_stage):
+            raise ApiError(422, "notes_need_replan", "notes only take effect when the plan is redone (from_stage=plan)")
+        # A resumed run keeps the configuration it was started with; the server's own
+        # --config/--set would silently replace it, so they are not passed here.
         argv = [sys.executable, "-m", "tyche", "run", "--resume", "--run-id", run_id, "--workspace", str(state.workspace_root)]
-        argv += _server_config_flags(state)
         if body.stage:
             argv += ["--stage", body.stage]
         if body.from_stage:
@@ -633,9 +703,10 @@ def _register_routes(app: FastAPI, state: AppState) -> None:
     @app.delete("/api/runs/{run_id}")
     def delete_run(run_id: str) -> dict[str, Any]:
         _require_run_dir(state, run_id)
-        if state.registry.live_process(run_id) is not None:
-            raise ApiError(409, "running", f"run {run_id!r} is running; stop it first")
-        trashed = web_runs.trash_run(state.workspace_root, run_id)
+        with state.run_lock(run_id):
+            if state.registry.live_process(run_id) is not None:
+                raise ApiError(409, "running", f"run {run_id!r} is running; stop it first")
+            trashed = web_runs.trash_run(state.workspace_root, run_id)
         return {"trashed": trashed}
 
     # -- library / lessons / doctor / settings -------------------------------
@@ -690,6 +761,13 @@ def _server_config_flags(state: AppState) -> list[str]:
 
 
 def _create_run(state: AppState, body: RunCreateBody) -> JSONResponse:
+    if body.run_id is not None and _RUN_ID_RE.fullmatch(body.run_id):
+        with state.run_lock(body.run_id):
+            return _create_run_locked(state, body)
+    return _create_run_locked(state, body)
+
+
+def _create_run_locked(state: AppState, body: RunCreateBody) -> JSONResponse:
     from tyche.textutil import slugify
 
     cfg = build_config(state)
@@ -699,13 +777,13 @@ def _create_run(state: AppState, body: RunCreateBody) -> JSONResponse:
     if body.direction not in DIRECTIONS:
         raise ApiError(422, "invalid_direction", f"direction must be one of {', '.join(DIRECTIONS)}")
     if body.run_id is not None:
-        if not _RUN_ID_RE.match(body.run_id):
+        if not _RUN_ID_RE.fullmatch(body.run_id):
             raise ApiError(422, "invalid_run_id", "run_id must match ^[a-z0-9][a-z0-9-]{2,63}$")
         run_id = body.run_id
     else:
         run_id = f"{datetime.now(timezone.utc):%Y%m%d-%H%M%S}-{slugify(topic, 32)}"
     run_dir = web_runs.run_dir_of(state.workspace_root, run_id)
-    if (run_dir / "state.json").exists():
+    if (run_dir / "state.json").exists() or state.registry.live_process(run_id) is not None:
         raise ApiError(409, "run_exists", f"run {run_id!r} already exists")
     if body.stop_after is not None and body.stop_after not in STAGES:
         raise ApiError(422, "invalid_stage", "stop_after must be a known stage")
@@ -718,6 +796,9 @@ def _create_run(state: AppState, body: RunCreateBody) -> JSONResponse:
         results_dir = Path(body.results_dir).expanduser().resolve()
         if not results_dir.is_dir():
             raise ApiError(422, "invalid_results_dir", "results_dir must be an existing directory")
+    for label, name in (("model_name", body.model.model_name), ("reviewer_model", body.model.reviewer_model)):
+        if name and not _MODEL_NAME_RE.fullmatch(name):
+            raise ApiError(422, f"invalid_{label}", f"{label} may use letters, digits and . _ : / @ + - only")
     if body.model.reasoning_effort is not None and body.model.reasoning_effort not in REASONING_LEVELS:
         raise ApiError(422, "invalid_reasoning_effort", f"reasoning_effort must be one of {', '.join(REASONING_LEVELS)}")
     max_main_pages = body.settings.max_main_pages
@@ -736,8 +817,7 @@ def _create_run(state: AppState, body: RunCreateBody) -> JSONResponse:
         str(state.workspace_root),
         "--run-id",
         run_id,
-        "--topic",
-        topic,
+        f"--topic={topic}",
         "--direction",
         body.direction,
     ]
@@ -754,7 +834,7 @@ def _create_run(state: AppState, body: RunCreateBody) -> JSONResponse:
     if results_dir is not None:
         argv += ["--results-dir", str(results_dir)]
     if body.model.model_name:
-        argv += ["--set", f"models.default.model_name={body.model.model_name}"]
+        argv += ["--set", f"models.default.model_name={json.dumps(body.model.model_name)}"]
     if body.model.reasoning_effort is not None:
         extra_body = dict(cfg.get("models.default.extra_body") or {})
         extra_body["reasoning_effort"] = body.model.reasoning_effort
@@ -764,7 +844,7 @@ def _create_run(state: AppState, body: RunCreateBody) -> JSONResponse:
     if body.model.timeout is not None:
         argv += ["--set", f"models.default.timeout={body.model.timeout}"]
     if body.model.reviewer_model:
-        argv += ["--set", f"models.reviewer.model_name={body.model.reviewer_model}"]
+        argv += ["--set", f"models.reviewer.model_name={json.dumps(body.model.reviewer_model)}"]
     if review_max_rounds is not None:
         argv += ["--set", f"review.max_rounds={review_max_rounds}"]
     if max_main_pages is not None:
@@ -899,9 +979,14 @@ def _serve_static(state: AppState, full_path: str):
 
 
 async def sse_lines(stream: AsyncIterator[dict[str, Any]]) -> AsyncIterator[str]:
-    """Serialize ``{"event", "data"}`` items as Server-Sent Events frames."""
+    """Serialize ``{"event", "data"}`` items as Server-Sent Events frames.
+
+    SSE ends a line only at CR, LF or CRLF; ``str.splitlines`` would also split at U+2028 and
+    other separators that JSON leaves unescaped, corrupting the payload.
+    """
     async for item in stream:
-        data = "\n".join(f"data: {line}" for line in (str(item["data"]).splitlines() or [""]))
+        lines = str(item["data"]).replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        data = "\n".join(f"data: {line}" for line in lines)
         yield f"event: {item['event']}\n{data}\n\n"
 
 

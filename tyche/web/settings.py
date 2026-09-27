@@ -24,7 +24,7 @@ SECRET_KEYS = ("API_KEY", "S2_API_KEY", "OPENALEX_API_KEY")
 
 
 class SettingsError(ValueError):
-    """A settings write was rejected: an unknown key or a multi-line value."""
+    """A settings write was rejected: an unknown key, or a value that cannot be written literally."""
 
 
 def read_values(env: Mapping[str, str]) -> dict[str, str]:
@@ -38,6 +38,13 @@ def read_key_presence(env: Mapping[str, str]) -> dict[str, bool]:
 def _check_single_line(key: str, value: str) -> None:
     if any(ch in value for ch in ("\n", "\r", "\0")):
         raise SettingsError(f"{key} must be a single line")
+    # Values are written single-quoted, which dotenv and shells read literally; these cannot be.
+    if any(ch in value for ch in ("'", "\\", "$", "`")):
+        raise SettingsError(f"{key} may not contain quotes, backslashes, '$' or '`'")
+
+
+def _quote(value: str) -> str:
+    return f"'{value}'" if value else ""
 
 
 def validate_updates(values: Mapping[str, str] | None, secrets: Mapping[str, str] | None) -> None:
@@ -81,11 +88,13 @@ def apply_env_updates(
     out_lines: list[str] = []
     for key, raw in lines:
         if key is not None and key in remaining:
-            out_lines.append(f"{key}={remaining.pop(key)}")
+            out_lines.append(f"{key}={_quote(remaining.pop(key))}")
+        elif key is not None and key in updates:
+            continue  # a later duplicate would win over the value just written
         else:
             out_lines.append(raw)
     for key, value in remaining.items():
-        out_lines.append(f"{key}={value}")
+        out_lines.append(f"{key}={_quote(value)}")
     text = "\n".join(out_lines)
     if text and not text.endswith("\n"):
         text += "\n"

@@ -143,13 +143,28 @@ export function subscribeRun(id: string, since: number, handlers: StreamHandlers
       retry = 1000;
       handlers.status?.(true);
     };
-    source.addEventListener("summary", (e) => handlers.summary?.(JSON.parse((e as MessageEvent).data)));
+    // One malformed frame must not throw inside the EventSource callback and stall the stream.
+    const parsed = <T,>(e: Event): T | undefined => {
+      try {
+        return JSON.parse((e as MessageEvent).data) as T;
+      } catch {
+        return undefined;
+      }
+    };
+    source.addEventListener("summary", (e) => {
+      const data = parsed<RunSummary & { stages: StageInfo[] }>(e);
+      if (data) handlers.summary?.(data);
+    });
     source.addEventListener("event", (e) => {
-      const data = JSON.parse((e as MessageEvent).data) as RunEvent;
+      const data = parsed<RunEvent>(e);
+      if (!data) return;
       cursor = Math.max(cursor, data.seq + 1);
       handlers.event?.(data);
     });
-    source.addEventListener("experiment", (e) => handlers.experiment?.(JSON.parse((e as MessageEvent).data)));
+    source.addEventListener("experiment", (e) => {
+      const data = parsed<ExperimentEvent>(e);
+      if (data) handlers.experiment?.(data);
+    });
     source.onerror = () => {
       handlers.status?.(false);
       source?.close();

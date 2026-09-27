@@ -70,13 +70,47 @@ def _cmdline(pid: int) -> list[str]:
         return []
 
 
-def _matches_run(cmdline: list[str], run_id: str) -> bool:
-    if not cmdline or "run" not in cmdline or not any("tyche" in part for part in cmdline):
-        return False
+def _option(cmdline: list[str], option: str, shortest: str) -> str | None:
+    """The value of ``option`` in an argv, in any form argparse accepts: ``--opt v``, ``--opt=v``, or an
+    unambiguous prefix of the option name no shorter than ``shortest``."""
     for i, part in enumerate(cmdline):
-        if part == "--run-id" and i + 1 < len(cmdline) and cmdline[i + 1] == run_id:
-            return True
-    return False
+        name, eq, value = part.partition("=")
+        if name.startswith(shortest) and option.startswith(name):
+            if eq:
+                return value
+            return cmdline[i + 1] if i + 1 < len(cmdline) else None
+    return None
+
+
+def _run_of(cmdline: list[str]) -> tuple[str, str | None] | None:
+    """``(run_id, workspace or None)`` when an argv is a ``tyche run`` invocation, else None."""
+    if not cmdline or "run" not in cmdline or not any("tyche" in part for part in cmdline):
+        return None
+    run_id = _option(cmdline, "--run-id", "--ru")
+    return (run_id, _option(cmdline, "--workspace", "--w")) if run_id else None
+
+
+def _same_workspace(workspace: str | None, workspace_root: Path | None, cwd: str | None = None) -> bool:
+    # A process that names no workspace uses its configured one, which cannot be read from outside.
+    if workspace is None or workspace_root is None:
+        return True
+    try:
+        base = Path(cwd) if cwd else Path.cwd()
+        return (base / workspace).expanduser().resolve() == workspace_root.resolve()
+    except OSError:
+        return True
+
+
+def _matches_run(cmdline: list[str], run_id: str, workspace_root: Path | None = None, cwd: str | None = None) -> bool:
+    found = _run_of(cmdline)
+    return found is not None and found[0] == run_id and _same_workspace(found[1], workspace_root, cwd)
+
+
+def _cwd(pid: int) -> str | None:
+    try:
+        return psutil.Process(pid).cwd()
+    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+        return None
 
 
 def _is_session_leader(pid: int) -> bool:
@@ -96,26 +130,23 @@ def scan_cli_processes(workspace_root: Path) -> dict[str, dict[str, Any]]:
     if cached is not None and now - cached[0] < _SCAN_TTL_S:
         return cached[1]
     found: dict[str, dict[str, Any]] = {}
-    for proc in psutil.process_iter(["pid", "cmdline", "status", "create_time"]):
+    for proc in psutil.process_iter(["pid", "cmdline", "status", "create_time", "cwd"]):
         try:
             info = proc.info
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
         if info.get("status") == psutil.STATUS_ZOMBIE:
             continue
-        cmdline = info.get("cmdline") or []
-        if not cmdline or "run" not in cmdline or not any("tyche" in part for part in cmdline):
+        run = _run_of(info.get("cmdline") or [])
+        if run is None or not _same_workspace(run[1], workspace_root, info.get("cwd")):
             continue
-        for i, part in enumerate(cmdline):
-            if part == "--run-id" and i + 1 < len(cmdline):
-                run_id = cmdline[i + 1]
-                started_at = None
-                create_time = info.get("create_time")
-                if create_time:
-                    from datetime import datetime
+        started_at = None
+        create_time = info.get("create_time")
+        if create_time:
+            from datetime import datetime
 
-                    started_at = datetime.fromtimestamp(create_time, tz=timezone.utc).isoformat(timespec="seconds")
-                found.setdefault(run_id, {"pid": info["pid"], "started_at": started_at, "source": "cli"})
+            started_at = datetime.fromtimestamp(create_time, tz=timezone.utc).isoformat(timespec="seconds")
+        found.setdefault(run[0], {"pid": info["pid"], "started_at": started_at, "source": "cli"})
     _scan_cache[workspace_root] = (now, found)
     return found
 
@@ -148,7 +179,7 @@ class ProcessRegistry:
         row = data.get(run_id)
         if row is not None:
             pid = row.get("pid")
-            if isinstance(pid, int) and _pid_alive(pid) and _matches_run(_cmdline(pid), run_id):
+            if isinstance(pid, int) and _pid_alive(pid) and _matches_run(_cmdline(pid), run_id, self.workspace_root, _cwd(pid)):
                 return {"pid": pid, "started_at": row.get("started_at"), "source": row.get("source", "web")}
             self.forget(run_id)
         cli = scan_cli_processes(self.workspace_root).get(run_id)
@@ -190,28 +221,38 @@ class Launcher:
         return self.registry.register(run_id, proc.pid, source="web")
 
     def stop(self, run_id: str, process: dict[str, Any]) -> None:
+        """Stop the run and everything it started: experiment scripts may sit in their own sessions."""
         pid = int(process["pid"])
         source = process.get("source", "web")
         use_group = source == "web" or _is_session_leader(pid)
+        try:
+            root = psutil.Process(pid)
+            # Collected before signalling: children re-parent once the run exits.
+            tree = [root, *root.children(recursive=True)]
+        except psutil.NoSuchProcess:
+            self.registry.forget(run_id)
+            return
 
         def _signal(sig: int) -> None:
-            try:
-                if use_group:
+            if use_group:
+                try:
                     os.killpg(os.getpgid(pid), sig)
-                else:
-                    os.kill(pid, sig)
-            except (ProcessLookupError, PermissionError):
-                pass
+                except (ProcessLookupError, PermissionError):
+                    pass
+            for proc in tree:
+                try:
+                    proc.send_signal(sig)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
 
         def _run() -> None:
             _signal(signal.SIGTERM)
-            deadline = time.monotonic() + _STOP_WAIT_S
-            while time.monotonic() < deadline:
-                if not _pid_alive(pid):
-                    self.registry.forget(run_id)
-                    return
-                time.sleep(0.2)
-            _signal(signal.SIGKILL)
+            _, alive = psutil.wait_procs(tree, timeout=_STOP_WAIT_S)
+            for proc in alive:
+                try:
+                    proc.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
             self.registry.forget(run_id)
 
         thread = threading.Thread(target=_run, daemon=True)

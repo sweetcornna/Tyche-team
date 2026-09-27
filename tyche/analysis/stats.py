@@ -31,6 +31,8 @@ _ITEM_ID_KEYS = ("pair_id", "id", "item_id", "question_id", "qid", "task_id", "i
 _BOOL_ALIASES = {
     "accuracy": ("correct", "is_correct", "exact_match", "em"),
     "success": ("success", "succeeded", "solved", "correct"),
+    # An exact-match rate reported over per-item correctness flags.
+    "exact_match": ("correct", "is_correct", "em"),
 }
 
 

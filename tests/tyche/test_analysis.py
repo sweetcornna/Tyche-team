@@ -269,6 +269,19 @@ def test_reproduction_is_exact_for_full_precision_values():
     assert rounded.variants["proposed"]["accuracy"].n == 288
 
 
+def test_exact_match_rate_is_read_from_per_item_correctness():
+    def variant(flags):
+        return {"exact_match": sum(flags) / len(flags), "per_question": [
+            {"id": f"seed{i}:heldout:rep{i}", "correct": bool(f)} for i, f in enumerate(flags)
+        ]}
+
+    variants = {"proposed": variant([1, 1, 1, 1, 1, 1, 1, 0]), "baseline": variant([1, 0, 0, 1, 0, 0, 1, 0])}
+    result = analyze(variants, plan_metrics=["exact_match"], resamples=100, permutations=100)
+    assert result.variants["proposed"]["exact_match"].n == 8
+    [comp] = result.comparisons
+    assert comp.n == 8 and abs(comp.diff - 0.5) < 1e-9
+
+
 def test_variants_reported_over_different_rows_are_not_paired():
     def rows(correct):
         return [

@@ -69,6 +69,8 @@ def test_malformed_calls_and_arguments_are_reported_not_guessed():
         bind_args(tool, {"n": "1", "extra": "x"})
     with pytest.raises(ValueError, match="invalid arguments for counted: n"):
         bind_args(tool, {"n": "many"})
+    # A report written as slightly broken JSON is repaired rather than bounced back.
+    assert bind_args(tool, {"n": "2", "items": '```json\n["a", "b",]\n```'}) == Counted(n=2, items=["a", "b"])
 
 
 # -- permissions and todos ----------------------------------------------------------

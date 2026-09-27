@@ -205,7 +205,7 @@ def bind_args(tool: Tool, raw: dict[str, str]) -> BaseModel:
         try:
             data[name] = json.loads(text)
         except json.JSONDecodeError:
-            data[name] = text.strip()
+            data[name] = _lenient_json(text)
     try:
         return tool.args.model_validate(data)
     except ValidationError as exc:
@@ -213,6 +213,19 @@ def bind_args(tool: Tool, raw: dict[str, str]) -> BaseModel:
             f"{'.'.join(str(p) for p in err['loc']) or 'arguments'}: {err['msg']}" for err in exc.errors()[:6]
         )
         raise ValueError(f"invalid arguments for {tool.name}: {problems}") from exc
+
+
+def _lenient_json(text: str) -> Any:
+    """JSON written a little wrong (fenced, trailing commas, unquoted keys), repaired; else the raw text."""
+    from tyche.llm import extract_json
+
+    stripped = text.strip()
+    if not stripped or stripped[0] not in "[{`":
+        return stripped  # a bare word or number: let the argument model coerce or reject it
+    try:
+        return extract_json(stripped)
+    except ValueError:
+        return stripped
 
 
 PROTOCOL = """How to act: call tools. Write each call as

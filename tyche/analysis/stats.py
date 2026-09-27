@@ -25,7 +25,8 @@ _HIGHER_TOKENS = {
     "accuracy", "acc", "f1", "success", "precision", "recall", "score", "reward", "em", "bleu", "rouge", "auc",
     "hit", "hits", "win", "pass", "correct", "exact",
 }
-_ITEM_ID_KEYS = ("id", "item_id", "question_id", "qid", "task_id", "index")
+# pair_id names one item across variants (an "id" often also carries the variant name).
+_ITEM_ID_KEYS = ("pair_id", "id", "item_id", "question_id", "qid", "task_id", "index")
 _BOOL_ALIASES = {
     "accuracy": ("correct", "is_correct", "exact_match", "em"),
     "success": ("success", "succeeded", "solved", "correct"),
@@ -96,22 +97,33 @@ class Analysis:
 # stratum="change_count" for change_count_accuracy, or pass="matched_budget".
 _GROUP_KEYS = (
     "stratum", "category", "question_set", "question_type", "qtype", "type", "set", "bucket", "slice", "split",
-    "subset", "task_type", "pass", "setting",
+    "subset", "task_type", "pass", "setting", "phase",
 )
 # Group values that stand for the headline evaluation when a metric names no group.
-_DEFAULT_GROUP_VALUES = {"main", "primary", "default", "test", "full"}
+_DEFAULT_GROUP_VALUES = {"main", "primary", "default", "test", "full", "eval", "evaluation"}
+# Per-item fields that mark an item whose call failed; a metric may be reported over scored items only.
+_FAILED_KEYS = ("error", "_fatal", "exception")
+# Aggregation words a metric name adds to its per-item field (mean_prompt_tokens -> prompt_tokens).
+_STAT_WORDS = {"mean", "avg", "average"}
 
 
 def _norm(text: Any) -> str:
     return re.sub(r"[^a-z0-9]+", "_", str(text).lower()).strip("_")
 
 
-def _item_subsets(items: list[dict[str, Any]], metric: str) -> list[list[dict[str, Any]]]:
-    """Candidate item sets a metric may be computed over, most specific first.
+def _stem(token: str) -> str:
+    return token[:-1] if len(token) > 3 and token.endswith("s") and not token.endswith("ss") else token
 
-    For each grouping field present on every item, keep the values the metric's name
-    mentions (change_count_accuracy -> stratum change_count); when it mentions none,
-    keep the default values (pass main) if the field has any, else every value.
+
+def _words(text: str) -> set[str]:
+    return {_stem(t) for t in re.split(r"[^a-z0-9]+", str(text).lower()) if t}
+
+
+def _group_keep(items: list[dict[str, Any]], metric: str) -> dict[str, set[str]]:
+    """Group values a metric is reported over, per grouping field present on every item.
+
+    Keep the values the metric's name mentions (change_count_accuracy -> stratum change_count);
+    when it mentions none, keep the default values (pass main, phase eval) if the field has any.
     """
     name = "_" + _norm(metric) + "_"
     keep: dict[str, set[str]] = {}
@@ -125,13 +137,67 @@ def _item_subsets(items: list[dict[str, Any]], metric: str) -> list[list[dict[st
         default = {v for v in values if _norm(v) in _DEFAULT_GROUP_VALUES}
         if named or default:
             keep[key] = named or default
-    subsets = []
-    if keep:
-        subset = [i for i in items if all(i[k] in vals for k, vals in keep.items())]
-        if subset:
-            subsets.append(subset)
-    subsets.append(items)
-    return subsets
+    return keep
+
+
+def _is_failed(item: dict[str, Any]) -> bool:
+    if any(item.get(key) not in (None, False, "", [], {}) for key in _FAILED_KEYS):
+        return True
+    status = item.get("status")
+    return isinstance(status, str) and status.lower() in {"failed", "error", "errored"}
+
+
+def _value_keys(metric: str, drop: set[str]) -> list[str]:
+    """Per-item fields that may hold ``metric``'s values, most literal first."""
+    keys = [metric]
+    for stem, aliases in _BOOL_ALIASES.items():
+        if stem in metric.lower():
+            keys.extend(aliases)
+    parts = [p for p in _norm(metric).split("_") if p and p not in drop]
+    for words in (parts, [p for p in parts if p not in _STAT_WORDS]):
+        name = "_".join(words)
+        keys.append(name)
+        if name.endswith("_rate"):
+            keys.append(name[: -len("_rate")])
+    return list(dict.fromkeys(k for k in keys if k))
+
+
+Rule = tuple[tuple[tuple[str, frozenset[str]], ...], str | None, bool]
+
+
+def _candidate_rules(items: list[dict[str, Any]], metric: str, description: str, value_keys: list[str]) -> list[Rule]:
+    """Item filters a metric may be computed over, most specific first: (group filters, flag, drop failed).
+
+    A boolean flag is a candidate only when the metric's name or its planned description names it
+    (stale_fact_rate "on changed-target queries" -> changed_target), never the value field itself.
+    """
+    keep = _group_keep(items, metric)
+    groups = tuple(sorted((k, frozenset(v)) for k, v in keep.items()))
+    words = _words(metric) | _words(description)
+    flags = []
+    if items:
+        shared = set.intersection(*(set(i) for i in items))
+        for key in sorted(shared - set(value_keys)):
+            if all(isinstance(i[key], bool) for i in items) and len({i[key] for i in items}) == 2:
+                if _words(key) and _words(key) <= words:
+                    flags.append(key)
+    rules: list[Rule] = []
+    for group in ((groups, ()) if groups else ((),)):
+        for flag in [*flags, None]:
+            for drop_failed in (True, False):
+                rules.append((group, flag, drop_failed))
+    return list(dict.fromkeys(rules))
+
+
+def _apply(items: list[dict[str, Any]], rule: Rule) -> list[dict[str, Any]]:
+    groups, flag, drop_failed = rule
+    return [
+        i
+        for i in items
+        if all(i.get(k) in vals for k, vals in groups)
+        and (flag is None or i.get(flag) is True)
+        and not (drop_failed and _is_failed(i))
+    ]
 
 
 def _values_for(items: list[dict[str, Any]], key: str) -> list[float] | None:
@@ -155,24 +221,50 @@ def _reproduces(values: list[float], target: float | None) -> bool:
     return abs(float(np.mean(values)) - target) <= 1e-3 * max(1.0, abs(target))
 
 
-def _item_values(
-    items: list[dict[str, Any]], metric: str, target: float | None = None
-) -> tuple[list[dict[str, Any]], list[float]] | None:
-    """Per-item values behind ``metric``: (items used, values), or None.
+def _select_items(
+    items_by_variant: dict[str, list[dict[str, Any]]], metric: str, targets: dict[str, float], description: str = ""
+) -> dict[str, tuple[list[dict[str, Any]], list[float]]]:
+    """Per-item values behind ``metric`` for each variant: {variant: (items used, values)}.
 
-    Values are accepted only when their mean reproduces the reported ``target``, so
-    a stratum-level metric never inherits the all-items accuracy's interval or test.
+    Values are accepted only when their mean reproduces the variant's reported value, so a
+    stratum-level metric never inherits the all-items accuracy's interval or test. One rule
+    (group filters, flag, failed-item handling, field) is chosen for all variants together:
+    the first that reproduces every variant's reported value. That keeps item sets comparable,
+    and a rate that is zero for one variant cannot pick a subset the others contradict.
     """
-    keys = [metric]
-    for stem, aliases in _BOOL_ALIASES.items():
-        if stem in metric.lower():
-            keys.extend(aliases)
-    for subset in _item_subsets(items, metric):
+    with_items = {name: items for name, items in items_by_variant.items() if items}
+    if not with_items:
+        return {}
+    union = [i for items in with_items.values() for i in items]
+    named = {
+        _norm(v) for k, vals in _group_keep(union, metric).items() for v in vals if _norm(v) not in _DEFAULT_GROUP_VALUES
+    }
+    keys = _value_keys(metric, named)
+    rules = _candidate_rules(union, metric, description, keys)
+
+    def hit(items: list[dict[str, Any]], rule: Rule, key: str, target: float):
+        subset = _apply(items, rule)
+        values = _values_for(subset, key)
+        return (subset, values) if values and _reproduces(values, target) else None
+
+    for rule in rules:
         for key in keys:
-            values = _values_for(subset, key)
-            if values and _reproduces(values, target):
-                return subset, values
-    return None
+            found = {name: hit(items, rule, key, targets[name]) for name, items in with_items.items()}
+            if all(found.values()):
+                return found  # type: ignore[return-value]
+    # Variants may report over different item sets; accept each one's own reproducing rule.
+    out = {}
+    for name, items in with_items.items():
+        for rule in rules:
+            found = next((f for key in keys if (f := hit(items, rule, key, targets[name]))), None)
+            if found:
+                out[name] = found
+                break
+    return out
+
+
+def _has_item_values(items: list[dict[str, Any]], metric: str) -> bool:
+    return bool(items) and any(_values_for([i for i in items if not _is_failed(i)], key) for key in _value_keys(metric, set()))
 
 
 _SEED_KEYS = ("seed", "run_seed", "trial_seed")
@@ -250,6 +342,62 @@ def pick_proposed(names: list[str], hint: str = "") -> str:
     )
 
 
+def _bound_notes(
+    summaries: dict[str, dict[str, MetricSummary]], metrics: list[str], per_item: dict[str, dict[str, np.ndarray]]
+) -> list[str]:
+    """Flag proportion metrics where two or more variants sit at 0 or 1: the experiment cannot rank them."""
+    notes = []
+    for metric in metrics:
+        values = {v: ms[metric].value for v, ms in summaries.items() if ms[metric].value is not None}
+        proportion = all(
+            ((arr := per_item[v].get(metric)) is not None and set(np.unique(arr)) <= {0.0, 1.0})
+            for v in values
+        )
+        if not proportion:
+            continue
+        for bound in (0.0, 1.0):
+            at = sorted(v for v, x in values.items() if x == bound)
+            if len(at) >= 2:
+                notes.append(
+                    f"{metric} is exactly {bound:g} for {', '.join(at)}: a ceiling/floor effect, so this experiment "
+                    "cannot separate those variants on this metric"
+                )
+    return notes
+
+
+# Words that end the name part of a planned metric's description ("Prompt tokens per query, ...").
+_DESCRIPTION_BREAK = re.compile(r"[:;,(.]|\s(?:on|over|per|using|for|across|with|measured|computed|of)\s", re.I)
+
+
+def map_planned_metrics(plan_metrics: list[str], reported: set[str]) -> dict[str, str]:
+    """Map each planned metric to the reported metric that implements it: {planned text: metric name}.
+
+    Plans may describe a metric in prose ("Exact-match accuracy on the latest value") while the
+    metrics files use an identifier (exact_match_accuracy). A planned entry maps to the reported
+    metric whose name words (minus mean/avg) all appear in the description's name part; the most
+    specific such metric wins, ties map nothing, and each reported metric is claimed once.
+    """
+    out: dict[str, str] = {}
+    claimed: set[str] = set()
+    for text in plan_metrics:
+        if text in reported:
+            if text not in claimed:
+                out[text] = text
+                claimed.add(text)
+            continue
+        head = _words(_DESCRIPTION_BREAK.split(str(text), maxsplit=1)[0])
+        scored = []
+        for metric in reported - claimed:
+            core = _words(metric) - _STAT_WORDS
+            if core and core <= head:
+                scored.append((len(core), metric))
+        scored.sort(reverse=True)
+        if scored and (len(scored) == 1 or scored[0][0] > scored[1][0]):
+            out[text] = scored[0][1]
+            claimed.add(scored[0][1])
+    return out
+
+
 def analyze(
     variants: dict[str, dict[str, Any]],
     *,
@@ -267,13 +415,16 @@ def analyze(
     names = [proposed] + [n for n in names if n != proposed]
     numeric = {name: numeric_metrics(variants[name], keep=set(plan_metrics)) for name in names}
     shared = set.intersection(*(set(m) for m in numeric.values()))
+    planned = map_planned_metrics(plan_metrics, shared)
+    described = {metric: text for text, metric in planned.items()}
     # Planned metrics first, then other metrics that differ between variants; metrics identical
     # for every variant (budgets, conformance flags, ...) carry no comparison and go last.
-    extras = sorted(shared - set(plan_metrics))
+    first = list(dict.fromkeys(planned.values()))
+    extras = sorted(shared - set(first))
     constant = [m for m in extras if len({round(numeric[n][m], 12) for n in names}) == 1]
-    ordered = [m for m in plan_metrics if m in shared] + [m for m in extras if m not in constant] + constant
+    ordered = first + [m for m in extras if m not in constant] + constant
     notes = []
-    missing = [m for m in plan_metrics if m not in shared]
+    missing = [m for m in plan_metrics if m not in planned]
     if missing:
         notes.append(f"planned metrics not reported by every variant: {', '.join(missing)}")
     if not ordered:
@@ -283,16 +434,21 @@ def analyze(
     per_item: dict[str, dict[str, np.ndarray]] = {}
     ids: dict[str, dict[str, list[str] | None]] = {}
     unmatched: set[str] = set()
+    items_by_variant = {}
     for name in names:
         items = variants[name].get("per_question") or []
         items = items if isinstance(items, list) else []
+        items_by_variant[name] = [i for i in items if isinstance(i, dict)] if all(isinstance(i, dict) for i in items) else []
         summaries[name] = {}
         per_item[name] = {}
         ids[name] = {}
-        for metric in ordered:
+    for metric in ordered:
+        targets = {name: numeric[name][metric] for name in names}
+        selected = _select_items(items_by_variant, metric, targets, described.get(metric, ""))
+        for name in names:
             summary = MetricSummary(value=numeric[name][metric])
-            found = _item_values(items, metric, numeric[name][metric]) if items else None
-            if items and found is None and _item_values(items, metric) is not None:
+            found = selected.get(name)
+            if found is None and _has_item_values(items_by_variant[name], metric):
                 unmatched.add(metric)
             if found:
                 used, values = found
@@ -353,6 +509,7 @@ def analyze(
         )
     if not comparisons:
         notes.append("no per-item data aligned across variants; paired tests were not computed")
+    notes.extend(_bound_notes(summaries, ordered, per_item))
     return Analysis(
         proposed=proposed,
         baselines=names[1:],

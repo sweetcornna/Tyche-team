@@ -157,7 +157,8 @@ def results_brief(analysis: Analysis) -> str:
         lines.append("Paired comparisons (proposed minus baseline):")
         for c in analysis.comparisons:
             rel = f", relative {c.relative:+.1f}%" if c.relative is not None else ""
-            verdict = "favors proposed" if c.better else "does not favor proposed"
+            tie = c.diff == 0 and c.ci_low == 0 and c.ci_high == 0
+            verdict = "identical per-item outcomes (a tie)" if tie else "favors proposed" if c.better else "does not favor proposed"
             lines.append(
                 f"  - {c.metric} vs {c.baseline}: diff {fmt(c.diff, c.metric)} ({analysis.confidence_percent}% CI "
                 f"{fmt(c.ci_low, c.metric)} to "

@@ -147,3 +147,88 @@ def test_constant_metrics_are_ordered_after_informative_ones():
     }
     result = analyze(variants, plan_metrics=["accuracy"], resamples=100, permutations=100)
     assert result.metrics == ["accuracy", "historical_accuracy", "call_budget_envelope"]
+
+
+def test_pilot_rows_failed_items_and_flag_subsets_are_selected_jointly():
+    """Rows carry a variant-specific id, a pilot phase, failed calls, and a changed-target flag.
+
+    The reported metrics use evaluation rows only, skip failed calls, and compute the stale rate
+    over changed-target queries; one rule must reproduce every variant, and pairing uses pair_id.
+    """
+
+    def rows(method, correct, stale):
+        out = []
+        for k in range(12):
+            changed = k % 2 == 0
+            out.append({
+                "id": f"s1:q{k}:{method}", "pair_id": f"s1:q{k}", "phase": "eval", "changed_target": changed,
+                "exact_match": bool(correct[k]), "stale_fact": bool(stale[k]) and changed,
+                "prompt_tokens": 100 + k + (50 if method == "proposed" else 0), "error": None,
+            })
+        out.append({"id": f"p:q0:{method}", "pair_id": "p:q0", "phase": "pilot", "changed_target": True,
+                    "exact_match": False, "stale_fact": True, "prompt_tokens": 999, "error": None})
+        out.append({"id": f"s1:q99:{method}", "pair_id": "s1:q99", "phase": "eval", "changed_target": True,
+                    "exact_match": False, "stale_fact": False, "prompt_tokens": None, "error": "timeout"})
+        return out
+
+    good = rows("proposed", [1] * 12, [0] * 12)
+    base = rows("baseline", [1, 0] * 6, [1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+
+    def summary(items):
+        scored = [i for i in items if i["phase"] == "eval" and not i["error"]]
+        changed = [i for i in scored if i["changed_target"]]
+        return {
+            "exact_match_accuracy": sum(i["exact_match"] for i in scored) / len(scored),
+            "stale_fact_rate": sum(i["stale_fact"] for i in changed) / len(changed),
+            "mean_prompt_tokens": sum(i["prompt_tokens"] for i in scored) / len(scored),
+            "per_question": items,
+        }
+
+    variants = {"proposed": summary(good), "baseline": summary(base)}
+    plan = ["Exact-match accuracy on the latest value.", "Stale_fact_rate on changed-target queries: fraction stale.",
+            "Prompt tokens per query, from the API."]
+    result = analyze(variants, plan_metrics=plan, resamples=200, permutations=200)
+    assert result.metrics[:3] == ["exact_match_accuracy", "stale_fact_rate", "mean_prompt_tokens"]
+    assert not any("planned metrics" in note for note in result.notes)
+    stale = result.variants["baseline"]["stale_fact_rate"]
+    assert stale.n == 6 and abs(stale.mean - 2 / 6) < 1e-9
+    assert result.variants["proposed"]["stale_fact_rate"].n == 6  # the same subset, although every row is 0
+    assert result.variants["proposed"]["exact_match_accuracy"].n == 12
+    by_metric = {c.metric: c for c in result.comparisons}
+    assert by_metric["exact_match_accuracy"].n == 12 and abs(by_metric["exact_match_accuracy"].diff - 0.5) < 1e-9
+    assert by_metric["stale_fact_rate"].n == 6
+    assert abs(by_metric["mean_prompt_tokens"].diff - 50) < 1e-9
+
+
+def test_planned_metric_descriptions_map_to_reported_names():
+    from tyche.analysis.stats import map_planned_metrics
+
+    reported = {"exact_match_accuracy", "stale_fact_rate", "stale_fact_rate_update", "mean_prompt_tokens", "accuracy"}
+    mapping = map_planned_metrics(
+        ["Stale_fact_rate on changed-target queries; report updates separately.", "Exact-match accuracy.",
+         "Prompt tokens per query", "Latency in seconds"],
+        reported,
+    )
+    assert mapping == {
+        "Stale_fact_rate on changed-target queries; report updates separately.": "stale_fact_rate",
+        "Exact-match accuracy.": "exact_match_accuracy",
+        "Prompt tokens per query": "mean_prompt_tokens",
+    }
+
+
+def test_ceiling_effects_and_ties_are_reported():
+    from tyche.analysis import results_brief
+
+    def rows(flags):
+        return [{"id": f"q{i}", "correct": bool(f)} for i, f in enumerate(flags)]
+
+    variants = {
+        "proposed": {"accuracy": 1.0, "per_question": rows([1] * 6)},
+        "oracle": {"accuracy": 1.0, "per_question": rows([1] * 6)},
+        "weak": {"accuracy": 0.5, "per_question": rows([1, 0] * 3)},
+    }
+    result = analyze(variants, plan_metrics=["accuracy"], resamples=100, permutations=100)
+    assert any("ceiling/floor" in n and "oracle, proposed" in n for n in result.notes)
+    brief = results_brief(result)
+    assert "accuracy vs oracle" in brief and "a tie" in brief
+    assert "accuracy vs weak" in brief and "favors proposed" in brief

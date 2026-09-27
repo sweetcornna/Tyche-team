@@ -432,3 +432,19 @@ async def test_revisions_restate_the_section_requirements(memory, tmp_path):
     assert "<section_contract>" not in llm.calls[-1][2] and "\\paragraph{Limitations.}" in llm.calls[-1][2]
     await writer.shorten("analysis", ctx, draft, 150)
     assert "\\paragraph{Limitations.}" in llm.calls[-1][2]
+
+
+def test_prose_that_names_pipeline_materials_is_flagged():
+    from tyche.gates.checks import check_internal_terms
+
+    sections = {
+        "analysis": "Failures are rare, and the results brief provides no per-item data for them.",
+        "method": "We follow the research plan. Evidence cards support each claim.",
+        "introduction": "Briefly, results show a clear gain; evidence from cards of prior work is mixed.",
+        "reproducibility": "The run record holds the research plan and the source manifest.",
+    }
+    findings = check_internal_terms(sections)
+    assert sorted((f.section, f.severity) for f in findings) == [
+        ("analysis", "major"), ("method", "major"), ("method", "major")
+    ]
+    assert "results brief" in findings[0].message

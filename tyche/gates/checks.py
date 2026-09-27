@@ -196,6 +196,37 @@ def check_structure(
     return findings
 
 
+# Names of Tyche's working materials. A reader sees only the paper, so prose that cites "the
+# results brief" or "the evidence cards" points at nothing; the facts must be stated directly.
+_INTERNAL_TERMS = re.compile(
+    r"\b(?:results?[ -]brief|evidence[ -]cards?|allowed[ -](?:citations|numbers)|number[ -]registry|findings[ -]ledger|"
+    r"experiment(?:al)?[ -]reflection|research[ -]plan|source[ -]manifest)\b",
+    re.I,
+)
+# Sections the pipeline writes itself, which describe the process and may name its materials.
+_GENERATED_SECTIONS = ("ai_statement", "reproducibility")
+
+
+def check_internal_terms(sections: dict[str, str]) -> list[GateFinding]:
+    findings = []
+    for name, body in sections.items():
+        if name in _GENERATED_SECTIONS:
+            continue
+        for match in _INTERNAL_TERMS.finditer(body):
+            context = body[max(0, match.start() - 60) : match.end() + 40].replace("\n", " ")
+            findings.append(
+                GateFinding(
+                    "structure",
+                    "major",
+                    name,
+                    f"refers to the pipeline's working material '{match.group(0)}', which readers never see; "
+                    "state the fact directly",
+                    context.strip(),
+                )
+            )
+    return findings
+
+
 def check_placeholders(sections: dict[str, str]) -> list[GateFinding]:
     findings = []
     for name, body in sections.items():
@@ -249,6 +280,7 @@ def run_gates(
     report.findings += check_numbers(sections, registry)
     report.findings += check_structure(sections, contracts, labels)
     report.findings += check_placeholders(sections)
+    report.findings += check_internal_terms(sections)
     report.stats = {
         "main_pages": main_pages,
         "total_pages": compile_result.pages,

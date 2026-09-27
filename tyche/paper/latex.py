@@ -262,11 +262,25 @@ def pdf_text(pdf: Path) -> str:
 
 def main_text_pages(pdf: Path) -> int:
     """Pages of main text: everything before the AI use statement (ICLR's page-limit convention)."""
-    pages = pdf_page_texts(pdf)
+    return main_pages_of(pdf_page_texts(pdf))
+
+
+def main_pages_of(pages: list[str]) -> int:
+    """``main_text_pages`` over extracted page texts.
+
+    A page that opens with the statement holds no main text. Its running header and the
+    review-mode line numbers (bare integers in the margin) are not text of the page.
+    """
     for index, page in enumerate(pages, start=1):
         if AI_STATEMENT_HEADING.lower() in page.lower():
             lines = [ln.strip() for ln in page.splitlines() if ln.strip()]
-            body = [ln for ln in lines if not ln.lower().startswith("under review as") and not ln.lower().startswith("published as")]
+            body = [
+                ln
+                for ln in lines
+                if not ln.isdigit()
+                and not ln.lower().startswith("under review as")
+                and not ln.lower().startswith("published as")
+            ]
             if body and body[0].lower().startswith(AI_STATEMENT_HEADING.lower()):
                 return index - 1
             return index

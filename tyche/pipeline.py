@@ -762,7 +762,9 @@ class Pipeline:
             "",
         ]
         for stage, row in state.get("stages", {}).items():
-            lines.append(f"- {stage}: {row.get('status')}")
+            # This report is written by the package stage itself, which is finishing now.
+            status = "this package" if stage == "package" else row.get("status")
+            lines.append(f"- {stage}: {status}")
         lines += ["", "## Model usage", "", f"- Total: {usage['total']}"]
         profiles = {
             role: getattr(getattr(self.svc, role), "profile", None) for role in ("planner", "writer", "reviewer")

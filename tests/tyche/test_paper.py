@@ -395,3 +395,16 @@ async def test_author_conversation_restarts_before_exceeding_the_history_budget(
         await writer.write(name, ctx, {})
     assert max(len(h) for h in llm.histories) < 8  # restarted instead of growing without bound
     assert writer.conversation.tokens() <= 6000 + 2 * 3000
+
+
+def test_main_pages_ignore_review_line_numbers_and_headers():
+    from tyche.paper.latex import main_pages_of
+
+    header = "Under review as a conference paper at ICLR 2027\n\n\n\n"
+    body = header + "268\nthe last lines of the conclusion.\n269\n"
+    # The statement opens page 3; review mode prints a line number before its heading.
+    opens = header + "270\nAI USE STATEMENT\n271\nThis paper was produced with Tyche.\n"
+    assert main_pages_of([body, body, opens, "REFERENCES"]) == 2
+    # When the statement starts mid-page, that page still holds main text.
+    assert main_pages_of([body, body + "AI USE STATEMENT\nText.\n"]) == 2
+    assert main_pages_of([body, body]) == 2

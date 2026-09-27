@@ -149,6 +149,21 @@ async def test_session_runs_tools_until_a_reply_without_calls(tmp_path):
     assert meter.summary()["total"]["cache_breaks"] == 0
 
 
+async def test_a_repeated_call_in_one_reply_runs_once():
+    runs = []
+    tool = Tool("note", "Note.", lambda a: runs.append(a.text) or "ok", Note, effect="edit")
+    replies = iter([call("note", text="a") + call("note", text="b") + call("note", text="a"), "Done."])
+    messages = []
+
+    def turn(system, user, history):
+        messages.append(user)
+        return next(replies)
+
+    await _session(ScriptedLLM({"agent:t": turn}), [tool]).run("Note.")
+    assert runs == ["a", "b"]
+    assert '<result call="3" tool="note" status="ok">\nidentical to call 1 in this reply; not run again' in messages[1]
+
+
 async def test_host_checks_hand_the_task_back_until_they_pass():
     state = {"fixed": False}
     fix = Tool("fix", "Fix it.", lambda: state.update(fixed=True) or "fixed", effect="edit")
@@ -380,7 +395,8 @@ async def test_planner_agent_searches_within_budget_and_submits_a_valid_plan(mem
     def turn(system, user, history):
         messages.append(user)
         if not history:
-            return call("search_literature", query="memory") * 5 + call("submit_plan", plan=bad)
+            searches = "".join(call("search_literature", query=f"memory {i}") for i in range(5))
+            return searches + call("submit_plan", plan=bad)
         return call("submit_plan", plan=PLAN)
 
     from tyche.agent import AgentSettings

@@ -307,7 +307,14 @@ class AgentSession:
                 )
                 continue
             results: list[tuple[ToolCall, ToolResult]] = []
+            seen: dict[str, int] = {}
             for call in calls:
+                key = json.dumps([call.tool, call.raw_args], sort_keys=True)
+                if key in seen:
+                    # Some models repeat a whole batch of calls in one reply; running it twice only costs time.
+                    results.append((call, ToolResult(f"identical to call {seen[key]} in this reply; not run again")))
+                    continue
+                seen[key] = call.index
                 result = await self._execute(call)
                 results.append((call, result))
                 calls_made += 1

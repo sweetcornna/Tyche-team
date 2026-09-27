@@ -110,6 +110,12 @@ def test_todo_list_allows_one_item_in_progress():
     assert todos.update(ok).ok
     assert todos.render() == "[x] a: first\n[>] b: second"
     assert [t.id for t in todos.open()] == ["b"] and len(seen) == 1
+    # What a real model wrote before the manual spelled out the item fields: no ids, "text" for content.
+    guessed = bind_args(tool, {"todos": json.dumps([{"text": "write method", "status": "in_progress"}, {"text": "build"}])})
+    assert todos.update(guessed).ok and todos.render() == "[>] 1: write method\n[ ] 2: build"
+    manual = tool.manual()
+    assert "- todos (JSON list, required)" in manual and "  each object has:" in manual
+    assert "  - content (text, required)" in manual and "  - status (pending | in_progress | completed | cancelled, optional)" in manual
 
 
 # -- the session loop ------------------------------------------------------------------

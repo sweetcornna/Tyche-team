@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 
 from tyche.agent.tools import Tool, ToolResult
 
@@ -27,8 +27,11 @@ class Todo:
 
 
 class TodoItem(BaseModel):
-    id: str = Field(description="Short stable id, e.g. 'method' or 'F3'.")
-    content: str = Field(description="What to do, as one imperative sentence.")
+    id: str = Field(default="", description="Short stable id, e.g. 'method' or 'F3'; numbered if omitted.")
+    content: str = Field(
+        description="What to do, as one imperative sentence.",
+        validation_alias=AliasChoices("content", "text", "title", "task"),
+    )
     status: Status = "pending"
 
 
@@ -61,6 +64,8 @@ class TodoList:
         return [Todo(t.id, t.content, t.status) for t in self.items]
 
     def update(self, args: TodoArgs) -> ToolResult:
+        for i, item in enumerate(args.todos, 1):
+            item.id = item.id or str(i)
         ids = [t.id for t in args.todos]
         if len(set(ids)) != len(ids):
             return ToolResult("todo ids must be unique", ok=False)

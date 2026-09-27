@@ -69,14 +69,35 @@ class Tool:
         fields = self.args.model_fields
         if fields:
             lines.append("Arguments:")
-            for name, info in fields.items():
-                kind = _type_name(info.annotation)
-                need = "required" if info.is_required() else "optional"
-                note = f": {info.description}" if info.description else ""
-                lines.append(f"- {name} ({kind}, {need}){note}")
+            lines += _field_lines(self.args, "")
         else:
             lines.append("No arguments.")
         return "\n".join(lines)
+
+
+def _item_model(annotation: Any) -> type[BaseModel] | None:
+    """The model of a list-of-objects argument, whose fields the manual spells out."""
+    if typing.get_origin(annotation) in (list, tuple):
+        args = typing.get_args(annotation)
+        if args and isinstance(args[0], type) and issubclass(args[0], BaseModel):
+            return args[0]
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return annotation
+    return None
+
+
+def _field_lines(model: type[BaseModel], indent: str) -> list[str]:
+    lines = []
+    for name, info in model.model_fields.items():
+        kind = _type_name(info.annotation)
+        need = "required" if info.is_required() else "optional"
+        note = f": {info.description}" if info.description else ""
+        lines.append(f"{indent}- {name} ({kind}, {need}){note}")
+        item = _item_model(info.annotation)
+        if item is not None:
+            lines.append(f"{indent}  each object has:" if kind == "JSON list" else f"{indent}  fields:")
+            lines += _field_lines(item, indent + "  ")
+    return lines
 
 
 def _call_without_args(run: Callable[..., Any], args: BaseModel) -> Any:
@@ -84,9 +105,11 @@ def _call_without_args(run: Callable[..., Any], args: BaseModel) -> Any:
 
 
 def _type_name(annotation: Any) -> str:
+    origin = typing.get_origin(annotation)
+    if origin is Literal:
+        return " | ".join(str(a) for a in typing.get_args(annotation))
     if _is_text(annotation):
         return "text"
-    origin = typing.get_origin(annotation)
     if origin in (list, tuple, set):
         return "JSON list"
     if origin is dict or (isinstance(annotation, type) and issubclass(annotation, BaseModel)):
@@ -95,8 +118,6 @@ def _type_name(annotation: Any) -> str:
         return "true/false"
     if annotation in (int, float):
         return "number"
-    if origin is Literal:
-        return " | ".join(str(a) for a in typing.get_args(annotation))
     return "JSON"
 
 

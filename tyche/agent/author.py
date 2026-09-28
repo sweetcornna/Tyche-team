@@ -211,9 +211,12 @@ class AgentAuthor:
 
         def build() -> AgentSession:
             self._helpers += 1
+            while (self.work_dir / "transcripts" / f"fact_checker_{self._helpers:02d}.jsonl").exists():
+                self._helpers += 1
             return AgentSession(
                 self.helper_llm,
                 name="fact_checker",
+                parent_session="author",
                 instructions=load_prompt("agent_fact_checker"),
                 tools=desk.read_tools(),
                 policy=self.settings.policy("read_only"),

@@ -71,7 +71,9 @@ const run = (id: string) => `/api/runs/${enc(id)}`;
 
 export const api = {
   meta: () => request<Meta>("/api/meta"),
-  models: () => request<ModelsResponse>("/api/models"),
+  models: (refresh = false) => request<ModelsResponse>(`/api/models?refresh=${refresh}`),
+  discoverModels: (body: { api_base?: string; provider?: string; api_key?: string; refresh?: boolean }, signal?: AbortSignal) =>
+    request<ModelsResponse>("/api/models/discover", { method: "POST", body: JSON.stringify(body), signal }),
   runs: (archived = false) => request<{ runs: RunSummary[] }>(`/api/runs?archived=${archived}`).then((r) => r.runs),
   run: (id: string) => request<RunDetail>(run(id)),
   events: (id: string, since = 0, limit = 1000) =>

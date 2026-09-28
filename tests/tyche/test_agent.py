@@ -146,7 +146,7 @@ async def test_session_runs_tools_until_a_reply_without_calls(tmp_path):
     assert '<result call="2" tool="note" status="ok">\nnoted two\n</result>' in seen[1]
     assert "## note (edit)" in session.system and "<tools>" in session.system
     kinds = [json.loads(line)["kind"] for line in (tmp_path / "t.jsonl").read_text().splitlines()]
-    assert kinds == ["task", "assistant", "result", "result", "assistant"]
+    assert kinds == ["task", "turn_start", "assistant", "result", "result", "turn_start", "assistant", "outcome"]
     # Every request extended the previous one: the provider's prefix cache is never broken.
     assert meter.summary()["total"]["cache_breaks"] == 0
 

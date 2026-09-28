@@ -22,7 +22,8 @@ interface Store {
   refreshRuns: () => Promise<void>;
   upsertRun: (r: RunSummary) => void;
   models: ModelsResponse | undefined;
-  loadModels: () => void;
+  modelsLoading: boolean;
+  loadModels: (refresh?: boolean) => void;
   searchOpen: boolean;
   setSearchOpen: (v: boolean) => void;
   settingsOpen: boolean;
@@ -38,7 +39,7 @@ interface Store {
 const StoreContext = createContext<Store | null>(null);
 
 export function StoreProvider({ children }: { children: ReactNode }) {
-  const [meta, setMeta] = useState<Meta>();
+  const [meta, setMetaState] = useState<Meta>();
   const [metaError, setMetaError] = useState<ApiError>();
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [runsLoaded, setRunsLoaded] = useState(false);
@@ -49,7 +50,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("general");
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [confirmState, setConfirmState] = useState<Store["confirmState"]>(null);
-  const modelsRequested = useRef(false);
+  const [modelsLoading, setModelsLoading] = useState(false);
+  const modelsRequest = useRef({ generation: 0, pending: false, loaded: 0 });
+  const metaRef = useRef<Meta>();
+  const setMeta = useCallback((next: Meta) => {
+    metaRef.current = next;
+    setMetaState(next);
+    modelsRequest.current = { generation: modelsRequest.current.generation + 1, pending: false, loaded: 0 };
+    setModels(undefined);
+  }, []);
 
   const reloadMeta = useCallback(async () => {
     try {
@@ -58,7 +67,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     } catch (e) {
       setMetaError(e as ApiError);
     }
-  }, []);
+  }, [setMeta]);
 
   const refreshRuns = useCallback(async () => {
     try {
@@ -82,16 +91,33 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     });
   }, []);
 
-  const loadModels = useCallback(() => {
-    if (modelsRequested.current) return;
-    modelsRequested.current = true;
+  const loadModels = useCallback((refresh = false) => {
+    const current = modelsRequest.current;
+    if (current.pending || (!refresh && Date.now() - current.loaded < 30000)) return;
+    current.pending = true;
+    setModelsLoading(true);
     api
-      .models()
-      .then(setModels)
-      .catch(() => {
-        modelsRequested.current = false;
+      .models(refresh)
+      .then((next) => {
+        if (current === modelsRequest.current) setModels(next);
+      })
+      .catch((error: Error) => {
+        if (current === modelsRequest.current) setModels({
+          models: metaRef.current ? [{ id: metaRef.current.model.model_name }] : [],
+          source: "config", error: error.message,
+        });
+      })
+      .finally(() => {
+        if (current !== modelsRequest.current) return;
+        current.pending = false;
+        current.loaded = Date.now();
+        setModelsLoading(false);
       });
   }, []);
+
+  useEffect(() => {
+    if (meta) loadModels();
+  }, [meta, loadModels]);
 
   useEffect(() => {
     void reloadMeta();
@@ -135,6 +161,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       refreshRuns,
       upsertRun,
       models,
+      modelsLoading,
       loadModels,
       searchOpen,
       setSearchOpen,
@@ -165,6 +192,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       refreshRuns,
       upsertRun,
       models,
+      modelsLoading,
       loadModels,
       searchOpen,
       settingsOpen,

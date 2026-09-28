@@ -16,8 +16,11 @@ VALUE_KEYS = (
     "MODEL_NAME",
     "MODEL_PROVIDER",
     "MODEL_CONTEXT_WINDOW",
+    "TYCHE_PLANNER_MODEL_NAME",
+    "TYCHE_WRITER_MODEL_NAME",
     "TYCHE_REVIEW_MODEL_NAME",
     "TYCHE_EXPERIMENT_MODEL_NAME",
+    "TYCHE_SUBJECT_MODEL_NAME",
     "TYCHE_CONTACT_EMAIL",
 )
 SECRET_KEYS = ("API_KEY", "S2_API_KEY", "OPENALEX_API_KEY")
@@ -56,6 +59,25 @@ def validate_updates(values: Mapping[str, str] | None, secrets: Mapping[str, str
             raise SettingsError(f"unknown secret key {key!r}")
     for key, value in {**(values or {}), **(secrets or {})}.items():
         _check_single_line(key, str(value))
+
+
+def validate_model_updates(values: Mapping[str, str]) -> None:
+    """Validate workbench inputs without changing the literal dotenv writer's contract."""
+    for key, value in values.items():
+        if value and (key == "MODEL_NAME" or key.endswith("_MODEL_NAME")):
+            from tyche.web.models import MODEL_NAME_RE
+
+            if not MODEL_NAME_RE.fullmatch(value):
+                raise SettingsError(f"{key} must be a valid model identifier")
+        if key == "MODEL_CONTEXT_WINDOW" and value and (not value.isdecimal() or int(value) < 1):
+            raise SettingsError("MODEL_CONTEXT_WINDOW must be a positive integer")
+        if key == "API_BASE" and value:
+            from tyche.web.models import models_endpoint
+
+            try:
+                models_endpoint(value, "OpenAI")
+            except ValueError as exc:
+                raise SettingsError(str(exc)) from exc
 
 
 def _parse_env_lines(text: str) -> list[tuple[str | None, str]]:

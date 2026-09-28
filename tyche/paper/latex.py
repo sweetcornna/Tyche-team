@@ -183,7 +183,10 @@ def latex_available() -> dict[str, str | None]:
 
 def pdf_pages(pdf: Path) -> int:
     try:
-        out = subprocess.run(["pdfinfo", str(pdf)], capture_output=True, text=True, timeout=30).stdout
+        out = subprocess.run(
+            ["pdfinfo", str(pdf)], capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=30,
+        ).stdout
     except (OSError, subprocess.TimeoutExpired):
         out = ""
     match = re.search(r"^Pages:\s+(\d+)", out, re.M)
@@ -211,7 +214,10 @@ def compile_pdf(tex: Path, *, timeout: int = 180) -> CompileResult:
         tex.name,
     ]
     try:
-        proc = subprocess.run(cmd, cwd=build, capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run(
+            cmd, cwd=build, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=timeout,
+        )
         returncode = proc.returncode
     except FileNotFoundError:
         return CompileResult(False, None, [LatexError("", None, "latexmk is not installed")], [], [], 0, 0)
@@ -240,7 +246,8 @@ def pdf_page_texts(pdf: Path) -> list[str]:
     """Text of each page, via pdftotext (layout mode)."""
     try:
         out = subprocess.run(
-            ["pdftotext", "-layout", str(pdf), "-"], capture_output=True, text=True, timeout=60
+            ["pdftotext", "-layout", str(pdf), "-"], capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=60,
         ).stdout
     except (OSError, subprocess.TimeoutExpired):
         out = ""

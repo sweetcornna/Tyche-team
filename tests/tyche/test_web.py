@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -576,7 +577,8 @@ def test_apply_env_updates_creates_file_atomically(tmp_path):
     updates = apply_env_updates(env_path, values={"API_BASE": "https://example.test/v1"})
     assert updates == {"API_BASE": "https://example.test/v1"}
     assert env_path.read_text(encoding="utf-8").strip() == "API_BASE='https://example.test/v1'"
-    assert (env_path.stat().st_mode & 0o777) == 0o600
+    if os.name != "nt":  # Windows uses ACLs; chmod only controls the read-only flag.
+        assert (env_path.stat().st_mode & 0o777) == 0o600
     with pytest.raises(SettingsError):
         apply_env_updates(env_path, values={"NOT_ALLOWED": "x"})
     env_path.write_text("MODEL_NAME=a\n# keep\nMODEL_NAME=b\n", encoding="utf-8")
@@ -942,5 +944,6 @@ def test_agent_transcript_pairs_results_and_hides_template_markers(tmp_path):
     assert turn["calls"][0]["result"]["text"] == "the method section is not written yet"
     assert turn["calls"][1]["duplicate_of"] == 1 and turn["calls"][1]["result"] is None
     assert body["items"][2] == {"kind": "operator", "at": 3.0, "turn": 2, "text": "Keep it short."}
-    # The last row is not a finished reply, so the session is still waiting on the model.
-    assert body["waiting_since"] == 3.0
+    # An unfinished transcript without a live process is interrupted, not still thinking.
+    assert body["waiting_since"] is None
+    assert body["status"] == "interrupted"

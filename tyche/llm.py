@@ -20,6 +20,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol, TypeVar
 
 from pydantic import BaseModel, ValidationError
@@ -87,24 +88,29 @@ class UsageMeter:
     stage: str = ""
     # Shared by every client of a run, so roles that share a model route share prefixes.
     ledger: cache.PrefixLedger = field(default_factory=cache.PrefixLedger)
+    # A JSONL file each record is appended to as soon as it is made, so a process that is
+    # killed mid-stage (an agent session can run for an hour) still leaves its accounting.
+    sink: Path | None = None
 
     def add(self, purpose: str, reply: LLMReply) -> None:
-        self.records.append(
-            UsageRecord(
-                purpose=purpose,
-                stage=self.stage,
-                model=reply.model,
-                input_tokens=reply.input_tokens,
-                output_tokens=reply.output_tokens,
-                latency_s=round(reply.latency_s, 3),
-                cached_tokens=reply.cached_tokens,
-                cache_write_tokens=reply.cache_write_tokens,
-                cache_reported=reply.cache_reported,
-                est_prompt_tokens=reply.est_prompt_tokens,
-                est_reusable_tokens=reply.est_reusable_tokens,
-                cache_break=reply.cache_break,
-            )
+        record = UsageRecord(
+            purpose=purpose,
+            stage=self.stage,
+            model=reply.model,
+            input_tokens=reply.input_tokens,
+            output_tokens=reply.output_tokens,
+            latency_s=round(reply.latency_s, 3),
+            cached_tokens=reply.cached_tokens,
+            cache_write_tokens=reply.cache_write_tokens,
+            cache_reported=reply.cache_reported,
+            est_prompt_tokens=reply.est_prompt_tokens,
+            est_reusable_tokens=reply.est_reusable_tokens,
+            cache_break=reply.cache_break,
         )
+        self.records.append(record)
+        if self.sink is not None:
+            with self.sink.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record.__dict__, ensure_ascii=False) + "\n")
 
     @staticmethod
     def _row(records: list[UsageRecord]) -> dict[str, Any]:

@@ -76,6 +76,7 @@ class Pipeline:
         self.experiment_followup = experiment_followup.strip()
         self.skill_export_dir = skill_export_dir
         self.echo = echo
+        self.svc.meter.sink = self.ws.run_dir / "usage.jsonl"
 
     # -- helpers -------------------------------------------------------
     def log(self, kind: str, **fields: Any) -> None:
@@ -131,11 +132,13 @@ class Pipeline:
         return self.ws.state
 
     def _flush_usage(self) -> None:
-        """Append this process's model usage to the run's usage log, so resumed runs keep totals."""
+        """Append this process's model usage to the run's usage log, so resumed runs keep totals.
+        With the meter's sink on that log, each record is already there and only memory is freed."""
         path = self.ws.run_dir / "usage.jsonl"
-        with path.open("a", encoding="utf-8") as handle:
-            for rec in self.svc.meter.records:
-                handle.write(json.dumps(rec.__dict__, ensure_ascii=False) + "\n")
+        if self.svc.meter.sink != path:
+            with path.open("a", encoding="utf-8") as handle:
+                for rec in self.svc.meter.records:
+                    handle.write(json.dumps(rec.__dict__, ensure_ascii=False) + "\n")
         self.svc.meter.records.clear()
 
     def usage_summary(self) -> dict[str, Any]:

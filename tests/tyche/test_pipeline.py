@@ -189,10 +189,17 @@ async def test_plan_stage_records_operator_notes(tmp_path):
     services = Services(planner=ScriptedLLM(handlers(), meter=meter), writer=None, reviewer=None, searchers=[],
                         verifier=None, s2=None, engine=None, meter=meter)
     for run_id, notes in (("with-notes", "Avoid ceiling effects.\n"), ("without-notes", "")):
+        meter.records.clear()
         ws = Workspace.create(tmp_path, run_id, topic="t", direction="memory_engine", config_digest="x")
         pipe = Pipeline(TycheConfig.load(env={}), ws, services, MemoryStore(tmp_path / "memory.db"),
                         load_direction("memory_engine"), echo=lambda *a: None, operator_notes=notes)
         await pipe.stage_plan()
+        # Each model call is in the run's usage log as soon as it is made, not when the stage ends,
+        # so a process killed mid-stage keeps its accounting.
+        rows = (ws.run_dir / "usage.jsonl").read_text(encoding="utf-8").splitlines()
+        assert rows and [json.loads(row)["purpose"] for row in rows] == [r.purpose for r in meter.records]
+        pipe._flush_usage()
+        assert len((ws.run_dir / "usage.jsonl").read_text(encoding="utf-8").splitlines()) == len(rows)
         if notes:
             assert ws.latest_path("operator_notes").read_text(encoding="utf-8") == notes
             assert ws.latest("plan").inputs == [ws.latest("operator_notes").id]

@@ -27,3 +27,27 @@ def test_stage_state_and_resume(tmp_path, workspace):
         Workspace.create(tmp_path, "run1", topic="t", direction="d", config_digest="x")
     with pytest.raises(StageError):
         workspace.latest_path("missing")
+
+
+def test_run_ids_are_never_paths(tmp_path):
+    for bad in ("../outside", ".hidden", "a/b", "", "x\n", "a\\b"):
+        with pytest.raises(StageError):
+            Workspace.create(tmp_path, bad, topic="t", direction="d", config_digest="x")
+        with pytest.raises(StageError):
+            Workspace.open(tmp_path, bad)
+    assert not (tmp_path.parent / "outside").exists()
+    Workspace.create(tmp_path, "Mem_Luna.1", topic="t", direction="d", config_digest="x")
+
+
+def test_a_run_has_one_writer_at_a_time(tmp_path):
+    from tyche.cli import _lock_run
+    from tyche.config import ConfigError
+
+    held = _lock_run(tmp_path, "run-a")
+    try:
+        with pytest.raises(ConfigError, match="already running"):
+            _lock_run(tmp_path, "run-a")
+        _lock_run(tmp_path, "run-b").close()
+    finally:
+        held.close()
+    _lock_run(tmp_path, "run-a").close()  # released with its process (here: its handle)

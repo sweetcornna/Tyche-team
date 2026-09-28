@@ -32,14 +32,18 @@ flowchart LR
 
 | 阶段 | 做什么 | 由谁负责 |
 |---|---|---|
-| S0 规划 | 把题目拆成 1–3 个研究问题、可证伪假设、方法机制、基线、指标与贡献 | 模型（结构化 JSON，校验后入库） |
+| S0 规划 | 把题目拆成 1–3 个研究问题、可证伪假设、方法机制、基线、指标与贡献；规划智能体先回顾经验、检索已有工作，校验后提交 | 规划智能体 + 代码校验 |
 | S1 文献 | 查询规划 → 三源检索 → 去重 → BM25 预排序 → 摘要级相关性筛选 → 一跳引文图扩展 → 元数据核验 → 证据卡（引文必须逐字出自摘要）→ 主题归纳 | 检索/核验：代码；筛选/归纳：模型 |
 | S2 实验 | 复用 openJiuwen `auto_research` 的 ManagerRuntime（仅开启 设计/编码/执行/反思，关闭其网页检索与 NeurIPS 报告模块）；也可导入团队自有实验结果 | openJiuwen 智能体 + 真实执行 |
-| S3 分析 | 逐条目 bootstrap 置信区间、配对 sign-flip 置换检验、方向感知的最优标注；生成表格、图和“允许数字登记表” | 代码（固定随机种子） |
-| S4 写作 | 按依赖顺序（方法→实验→分析→相关工作→引言→结论→摘要）逐节写作；每次调用的上下文由记忆引擎在 token 预算内装配并留存清单 | 模型 + 确定性清洗 |
-| S5 评审 | 三位视角评审（严谨性/新颖与定位/清晰与影响）按 Agentic Reviewer 的 7 个维度打分 + 忠实度审计；发现写入台账，定向修订，重新编译与门禁，分数不降才接受 | 模型评审 + 代码裁决 |
+| S3 分析 | 逐条目 bootstrap 置信区间、配对 sign-flip 置换检验、方向感知的最优标注；逐条目子集（评估阶段、剔除失败调用、按标志筛选）须**对所有变体同时复现**实验报告值才被采用；天花板/地板效应与平局自动标注；生成表格、图和“允许数字登记表” | 代码（固定随机种子） |
+| S4 写作 | 作者智能体按依赖顺序（方法→实验→分析→相关工作→引言→结论→摘要）通过工具写作，每次编辑后立即检查，编译通过且无阻断与重大问题才能结束；上下文由记忆引擎装配并留存清单 | 作者智能体 + 确定性工具与门禁 |
+| S5 评审 | 三位视角评审（严谨性/新颖与定位/清晰与影响）按 Agentic Reviewer 的 7 个维度打分 + 忠实度审计，均先用只读工具核对数字与证据再提交；发现写入台账，作者智能体逐条修订并回复，重新编译与门禁，分数不降才接受 | 评审智能体 + 代码裁决 |
 | S6 演进 | 从台账提炼写作经验；跨 ≥2 次运行复现且修复被接受并提分才晋升为生效经验；无效则淘汰；导出为 JiuwenSwarm 技能 `evolutions.json` | 模型提炼 + 代码门控 |
-| S7 打包 | 论文 PDF、LaTeX 源码、全部产物的 SHA-256 溯源清单、评审台账、门禁报告、运行报告（含各阶段 token 用量） | 代码 |
+| S7 打包 | 论文 PDF、LaTeX 源码、全部产物的 SHA-256 溯源清单、评审台账、门禁报告、**论断–证据地图** `claims.json`、**环境快照** `environment.json`、运行报告（含各阶段 token 用量） | 代码 |
+
+### 智能体：借鉴 Claude Code 与 Codex
+
+Tyche 的规划、写作与评审默认以智能体会话运行（`tyche/agent/`，`agents.enabled`），工作方式借鉴 Claude Code 与 Codex，只借鉴理念，不复制代码与提示词。模型通过工具循环完成任务：权限模式限定每类智能体能用的工具；智能体自己维护待办清单；每次编辑后宿主立即检查该节；结束前宿主编译全文并运行全部门禁，有问题就退回；事实核查与每位评审在全新上下文中作为子智能体工作；长对话写工作摘要后继续，而不是截断；被拒绝的修订截断回检查点；每个会话留有完整转录。所有工具都是确定性代码，没有任何工具能登记数字、加入参考文献或让门禁通过。`agents.enabled: false` 恢复逐节单次调用。
 
 更详细的设计见 [docs/tyche/DESIGN.md](docs/tyche/DESIGN.md)。
 
@@ -58,10 +62,14 @@ Tyche 既能就三个方向**生成论文**（`--direction context_engineering |
 | 路径 | 内容 |
 |---|---|
 | `tyche/` | 全部自研代码：配置、LLM 封装、工作区与溯源、记忆引擎、文献、实验桥接、统计分析、论文写作与编译、门禁、评审、演进、流水线、CLI、离线自检 |
-| `tests/tyche/` | 88 个离线单元/端到端测试（含真实 LaTeX 编译的完整自检） |
+| `tyche/agent/` | 智能体运行时（工具协议、权限模式、待办清单、结束前检查、子智能体、上下文压缩、回滚、操作者插话、转录）、论文工作台工具与作者智能体 |
+| `tyche/trace/` | 可追溯层：论断–证据地图、逐轮修订差异、产物谱系、环境快照、打包目录离线核验 `tyche verify`（均由确定性代码计算，不调用模型） |
+| `tyche/web/` | 科研工作台 `tyche ui`：FastAPI 后端（只监听本机、Host/Origin 校验、SSE 实时推送）与 React 前端 |
+| `tests/tyche/` | 272 个离线单元/端到端测试（含真实 LaTeX 编译的完整自检与 Web API 测试） |
 | `jiuwenswarm/resources/agent/workspace/skills/tyche-iclr-paper/` | SwarmFlow 蜂群技能：按阶段编排，可在 TUI `/swarmflows` 监控，支持人工审批研究计划 |
 | `jiuwenswarm/resources/agent/workspace/skills/tyche-paper/` | Agent 模式技能：在对话中驱动 `tyche` |
 | `scripts/tyche/install_dev.sh` | 开发环境安装；gitcode 不可达时自动改用 GitHub 镜像的**同一提交** |
+| `scripts/tyche/make_submission.py`、`tyche/submission.py`、`docs/tyche/submission/` | 按赛事提交样例生成提交目录：论文、代码快照与入口、运行配置、锁定依赖、设计文档、由运行日志计算的资源报告、隐去端点的证据包（见 [docs/tyche/SUBMISSION.md](docs/tyche/SUBMISSION.md)） |
 | `pyproject.toml` | 注册 `tyche` 包、数据文件与 `tyche` 命令 |
 
 openJiuwen 本身未作修改：实验环节通过公开接口调用 `openjiuwen.rsi.artifact_rsi.paper_opt.auto_research`，技能演进导出复用 `openjiuwen.agent_evolving` 的数据结构。
@@ -71,7 +79,7 @@ openJiuwen 本身未作修改：实验环节通过公开接口调用 `openjiuwen
 环境要求：Python 3.11–3.13、[uv](https://docs.astral.sh/uv/)、TeX Live（`latexmk`、`pdflatex`、`bibtex`）与 poppler（`pdftotext`、`pdfinfo`）。
 
 ```bash
-# 1. 安装（Ubuntu 示例）
+# 1. 安装（Ubuntu 示例；macOS 用 `brew install texlive poppler`，无需 sudo）
 sudo apt-get install -y latexmk texlive-latex-recommended texlive-latex-extra texlive-fonts-recommended poppler-utils
 scripts/tyche/install_dev.sh          # 创建 .venv 并安装锁定依赖、JiuwenSwarm 与 Tyche
 source .venv/bin/activate
@@ -92,17 +100,43 @@ tyche run --resume --run-id <run-id>
 
 产物位于 `workspace/runs/<run-id>/package/`：`paper.pdf`、`paper_source/`、`run_record/`（全部产物版本、上下文装配清单、评审轮次、事件与用量日志、运行配置）、`provenance.json`、`review_ledger.json`、`gates.json`、`run_report.md`。用 `--allow-gate-failures` 强制打包未通过门禁的论文时，文件名为 `paper_UNVERIFIED.pdf`，其 AI use statement 会被重新生成并注明未通过核验。
 
-每个运行的完整配置保存在 `runs/<run-id>/config.json`，`--resume` 时自动沿用（本次命令行给出的 `--engine`、`--set` 等会叠加并保存）。`--resume --stage X` 重跑某阶段时，其后所有阶段会被重置为待运行，避免沿用过期结果。
+每个运行的完整配置保存在 `runs/<run-id>/config.json`，`--resume` 时自动沿用（本次命令行给出的 `--engine`、`--set` 等会叠加并保存）。`--resume --stage X` 只重跑阶段 X，`--resume --from-stage X` 从 X 重跑并继续到最后（或 `--stop-after`）；两者都会把 X 及其后的阶段重置为待运行，避免沿用过期结果。续跑时若未给 `--notes`，规划阶段沿用该运行记录的研究备注。
 
 常用选项：
 
+- `--from-stage experiments --experiment-followup <文本或文件>`：给 openJiuwen 实验智能体一条操作者指令（例如“先校准难度，避免所有变体都为 0”）。它通过 openJiuwen 的续跑引导（resume steering）作用于最近一次实验尝试，即使该尝试已结束也会重新打开；指令作为 `experiment_followup` 产物记入运行记录。
 - `--engine imported --results-dir <dir>`：使用团队自己跑出的 `<variant>.metrics.json`（可含逐条目结果 `per_question`），跳过自动实验。
 - `--set review.max_rounds=4`、`--set paper.max_main_pages=6`：覆盖任意配置项（默认值见 `tyche/configs/tyche.default.yaml`）。
 - 模型分角色配置（`models.<role>`，未设置的字段继承 `models.default`）：`planner`、`writer`、`reviewer`、`experiments`（openjiuwen 实验智能体）、`subject`（生成的实验代码通过 `API_KEY/API_BASE/MODEL_NAME` 调用的被测模型）。`TYCHE_REVIEW_MODEL_NAME`、`TYCHE_EXPERIMENT_MODEL_NAME` 可分别为评审与实验智能体指定更强的模型，DeepSeek 下默认所有角色都用最新的 `deepseek-flash`（DeepSeek-V4.1-Flash）；也可让评审改用 `deepseek-v4-pro`，用不同模型评审能降低自我认同偏差。
 - DeepSeek V4/V4.1 是推理模型，隐藏推理会计入 `max_tokens`，默认上限为 32768；如需关闭推理，可设 `--set 'models.default.extra_body={"thinking":{"type":"disabled"}}'`。
 - `context_window`（默认 131072，环境变量 `MODEL_CONTEXT_WINDOW`）是模型可接受的输入加输出上限；作者对话在即将超出时重新开始。DeepSeek-V4.1-Flash 支持 1M，可设 `MODEL_CONTEXT_WINDOW=1000000`。
+- 其他 OpenAI 兼容端点（官方 API 或自建网关）：在 `.env` 中设置 `API_BASE`、`MODEL_NAME`、`MODEL_CONTEXT_WINDOW`，再用 `--config docs/tyche/configs/reasoning-max.yaml` 以最高推理强度运行（`reasoning_effort: max`、`max_tokens: 65536`、超时 1800 秒；强度取端点支持的档位）。示例论文即用此配置在 `gpt-6-luna` 上生成。
+- 文献检索：Semantic Scholar 与 OpenAlex 会限流匿名请求（HTTP 429），建议在 `.env` 中填写免费的 `S2_API_KEY`、`OPENALEX_API_KEY`；Tyche 按服务要求的 `Retry-After` 等待（上限 90 秒）。export.arxiv.org 在限流某个主机时会对所有未命中缓存的查询返回空响应的 HTTP 406，此时 Tyche 记录为来源错误并继续使用其他来源，不会绕过限流。
 - `tyche review paper.pdf`：用本地 7 维评审团评审任意论文 PDF。
+- `tyche verify workspace/runs/<run-id>/package`：离线核验一个打包目录（不调用模型）：产物哈希、论文 PDF、由指标文件重算的统计量与允许数字登记表、论文正文中的每个数字、引用来源、论断–证据地图。复现审核可直接使用。
 - `tyche lessons`：查看跨运行写作经验及其状态。
+
+## 科研工作台（`tyche ui`）
+
+```bash
+tyche ui                       # 打开 http://127.0.0.1:8765 ；--port、--workspace、--no-browser 可选
+                               # 供局域网访问：--host 0.0.0.0 --allow-remote（需使用打印的带令牌链接）
+```
+
+![Tyche 科研工作台：对话式运行视图与评审面板](docs/tyche/images/ui-run-zh.png)
+
+一个仿照桌面聊天应用交互设计的本地科研工作台（中英双语、明暗主题、适配手机），与命令行共用同一个工作区：
+
+- **对话式运行视图**：输入研究题目、选择方向与模型推理强度即可开始；每个阶段像一条回复一样展开（计划、文献统计、openJiuwen 实验四个模块的实时进度、结果表与置信区间、写作章节、评审分数曲线与 7 维分数、打包好的论文卡片），附用时与 token 用量；运行中通过 SSE 实时更新，命令行启动的运行也会被识别。
+- **计划审批门**：默认在规划后暂停；可直接批准继续，或在输入框里写下修改意见，Tyche 带着备注重新规划并再次等待审批。
+- **智能体活动流**：规划、写作与评审阶段实时显示智能体的工作，风格参照 Codex：智能体说的话；连续的查询折叠成一组（"读取 2 次、查询数字 4 次"），每行是图标、动作、对象和一行结果（"455 词 · 无问题"），点开看参数与输出；撰写、编辑（显示删改行）、编译、计划更新、检查退回单独成行。底部状态行显示哪个智能体在思考、已用时和当前待办；完成的阶段折叠为"工作了 1 小时 20 分 · 42 次工具调用"。侧边面板"智能体"页可查看每个会话（含事实核查与各位评审）的完整活动流。
+- **运行中插话**：运行时底部就是输入框，可随时给智能体补充要求或信息，不必停止运行；消息先显示为排队，在规划者或作者的下一回合送达后进入活动流。命令行等价命令是 `tyche message --run-id <id> "…"`（不带文本则列出消息与送达情况）。
+- **可控执行**：停止、续跑、从任意阶段重跑（`--from-stage`）、门禁未通过时显式选择 UNVERIFIED 打包。
+- **侧边面板**（可拖拽宽度）：论文 PDF、完整研究计划、文献（证据卡原文）、实验（设计、智能体时间线、生成代码浏览、原始指标、反思）、结果（配对比较）、评审（逐轮分数、评审意见、发现台账、门禁）、**论断–证据地图**、**修订差异**、**产物谱系与环境快照**、运行报告、全部产物版本、日志。
+- **论文库**与**写作经验**页；设置页可修改模型端点与密钥（密钥只写不读，写入被忽略的 `.env`）并运行环境诊断。
+- 安全：只监听 `127.0.0.1`，校验 Host/Origin 防 DNS 重绑定；所有数字与引用仍由确定性代码提供，界面不调用模型改写任何证据。
+
+前端源码在 `tyche/web/frontend/`（React + TypeScript + Tailwind，`npm run build` 生成 `dist/`）；`scripts/tyche/install_dev.sh` 在有 Node.js 20+ 时自动构建。
 
 ### 提示缓存（各模型服务商的缓存命中）
 
@@ -171,8 +205,9 @@ tyche run --resume --run-id <run-id>
 ```bash
 source .venv/bin/activate
 ruff check tyche tests/tyche
-pytest tests/tyche                       # 88 项，含真实 LaTeX 编译的端到端自检
+pytest tests/tyche                       # 272 项，含真实 LaTeX 编译的端到端自检
 tyche selftest
+npm --prefix tyche/web/frontend test     # 前端单元测试（需 Node.js）
 python jiuwenswarm/resources/agent/workspace/skills/swarmskill-creator/scripts/validate_swarmskill.py \
     jiuwenswarm/resources/agent/workspace/skills/tyche-iclr-paper
 ```
@@ -199,6 +234,14 @@ Language models propose plans, prose, and critiques. Deterministic code handles 
 
 Experiments reuse openJiuwen's `auto_research` runtime; alternatively, the team can import its own metrics.
 
+Planning, writing, and review run as agent sessions modelled on coding agents such as Claude Code and Codex
+(concepts only): the model acts through deterministic tools under a permission mode, keeps a todo list, gets each
+edit checked at once, cannot finish while the compiled paper fails a gate, delegates fact checks to subagents with a
+fresh context, and has long histories compacted rather than cut. No tool can register a number, add a reference, or
+pass a gate, so the evidence boundary is unchanged. While a run works, the operator can add requirements from the
+workbench or with `tyche message --run-id ID "..."`; the planner or author receives each message at its next turn,
+and the run record keeps every message and when it was delivered.
+
 A three-lens review panel scores the Stanford Agentic Reviewer's seven dimensions, and a fidelity auditor checks
 claims against the evidence. Their findings drive targeted, acceptance-tested revisions.
 
@@ -206,4 +249,8 @@ Lessons distilled from reviews evolve across runs through a promotion/retirement
 JiuwenSwarm's skill `evolutions.json` format.
 
 To get started, run `tyche selftest`, which is fully offline and still compiles a real PDF, then `tyche doctor`,
-then `tyche run --topic ... --direction ...`.
+then `tyche run --topic ... --direction ...`, or open the local research workbench with `tyche ui`. The workbench
+shows each run as a conversation with live stage progress, a plan-approval gate, and a side panel with the paper,
+sources, experiment code, results, reviews, a claim-evidence map, revision diffs, and artifact lineage.
+
+![Tyche workbench: run view with the claim-evidence map](docs/tyche/images/ui-run.png)

@@ -28,7 +28,7 @@ import shutil
 from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
-from typing import Any, Collection, Iterator, Protocol
+from typing import Any, Collection, Iterable, Iterator, Protocol
 
 import yaml
 
@@ -92,6 +92,8 @@ class ExperimentOutcome:
     reflections: list[Path] = field(default_factory=list)
     notes: str = ""
     synthetic: bool = False
+    # The openjiuwen manager attempt this run drove; its agent traces record the agents' usage.
+    attempt_dir: Path | None = None
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -110,7 +112,7 @@ class ExperimentEngine(Protocol):
     name: str
 
     async def run(
-        self, plan: ResearchPlan, *, summary_path: Path, work_dir: Path, run_id: str
+        self, plan: ResearchPlan, *, summary_path: Path, work_dir: Path, run_id: str, followup: str = ""
     ) -> ExperimentOutcome: ...
 
 
@@ -172,7 +174,9 @@ class ImportedEngine:
         self.synthetic = synthetic
         self.name = label
 
-    async def run(self, plan: ResearchPlan, *, summary_path: Path, work_dir: Path, run_id: str) -> ExperimentOutcome:
+    async def run(
+        self, plan: ResearchPlan, *, summary_path: Path, work_dir: Path, run_id: str, followup: str = ""
+    ) -> ExperimentOutcome:
         if self.results_dir is None:
             return ExperimentOutcome("failed", self.name, {}, notes="no results directory configured; pass --results-dir")
         if not self.results_dir.is_dir():
@@ -357,6 +361,75 @@ def code_implementation_agent(config: dict[str, Any], model: Any, max_iterations
     return TycheCodeImplementationAgent(config, model=model)
 
 
+# openjiuwen's ObservabilityRail writes one JSONL trace per module attempt, with a
+# ``model_call_end`` event (and the provider's usage) for every model call its agents make.
+_TRACE_GLOB = "modules/*/*/agent_trace.jsonl"
+
+
+def _int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def openjiuwen_usage(attempt_dir: Path) -> dict[str, Any]:
+    """Model calls and tokens of openjiuwen's experiment agents in one manager attempt, by module.
+
+    Read from the agent traces openjiuwen writes itself; Tyche's own calls are metered separately
+    (usage.jsonl). Calls whose trace carries no usage are counted as such, never estimated.
+    """
+    from tyche.workspace import read_jsonl
+
+    modules: dict[str, dict[str, int]] = {}
+    for path in sorted(attempt_dir.glob(_TRACE_GLOB)):
+        entry = modules.setdefault(
+            path.parent.parent.name,
+            {"calls": 0, "calls_without_usage": 0, "failed_calls": 0, "input_tokens": 0, "cached_tokens": 0, "output_tokens": 0},
+        )
+        for row in read_jsonl(path):
+            event = row.get("event")
+            if event == "model_call_error":
+                entry["failed_calls"] += 1
+            # After an error the rail also closes the call with an empty end record (no call id).
+            if event != "model_call_end" or (row.get("call_id") is None and not row.get("usage")):
+                continue
+            entry["calls"] += 1
+            usage = row.get("usage") or {}
+            if not usage:
+                entry["calls_without_usage"] += 1
+                continue
+            entry["input_tokens"] += _int(usage.get("input_tokens", usage.get("prompt_tokens")))
+            entry["output_tokens"] += _int(usage.get("output_tokens", usage.get("completion_tokens")))
+            entry["cached_tokens"] += _int(usage.get("cache_read_tokens", usage.get("prompt_cache_hit_tokens")))
+    return {"attempt": attempt_dir.name, "modules": modules}
+
+
+def agent_usage_totals(usages: Iterable[dict[str, Any]]) -> dict[str, int]:
+    """Totals over attempts, keeping only the last record of each attempt (a resumed attempt's
+    traces keep growing, so its earlier records are subsets and must not be added again)."""
+    latest = {str(u["attempt"]): u for u in usages if isinstance(u, dict) and u.get("attempt")}
+    totals = {"attempts": len(latest), "calls": 0, "calls_without_usage": 0, "failed_calls": 0,
+              "input_tokens": 0, "cached_tokens": 0, "output_tokens": 0}
+    for usage in latest.values():
+        for entry in (usage.get("modules") or {}).values():
+            for key in totals:
+                if key != "attempts":
+                    totals[key] += _int(entry.get(key))
+    return totals
+
+
+def collect_agent_traces(attempt_dir: Path, target: Path) -> int:
+    """Copy an attempt's agent traces to ``target/<attempt>/`` (same relative paths); returns the count."""
+    count = 0
+    for path in sorted(attempt_dir.glob(_TRACE_GLOB)):
+        dest = target / attempt_dir.name / path.relative_to(attempt_dir)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, dest)
+        count += 1
+    return count
+
+
 class OpenJiuwenEngine:
     name = "openjiuwen"
 
@@ -367,7 +440,12 @@ class OpenJiuwenEngine:
         # The model the generated experiment code calls (via API_* env vars).
         self.subject = subject or spec
 
-    async def run(self, plan: ResearchPlan, *, summary_path: Path, work_dir: Path, run_id: str) -> ExperimentOutcome:
+    async def run(
+        self, plan: ResearchPlan, *, summary_path: Path, work_dir: Path, run_id: str, followup: str = ""
+    ) -> ExperimentOutcome:
+        """Drive one manager attempt. ``followup`` is an operator instruction: it steers the latest
+        attempt through openjiuwen's resume steering (reopening it if it had finished), or, when a
+        fresh attempt starts, is added to its constraints."""
         from openjiuwen.rsi.artifact_rsi.paper_opt.auto_research.common import workspace as arw
         from openjiuwen.rsi.artifact_rsi.paper_opt.auto_research.modules.experiment_design.agent import (
             ExperimentDesignAgent,
@@ -393,15 +471,23 @@ class OpenJiuwenEngine:
             ),
             reflection=ReflectionAgent(config, model=self.model),
         )
+        objective = objective_text(plan, self.settings)
+        constraints = [str(c) for c in self.settings.get("constraints") or []]
+        digest = inputs_digest(plan_markdown(plan), summary_path.read_text(encoding="utf-8"), objective, constraints)
         # An interrupted attempt (no terminal record) is resumed where it stopped, keeping its
-        # design revisions and results. Otherwise a fresh manager run per attempt: a rerun must
-        # never mix in metrics or reflections from an earlier, finished attempt's variants.
+        # design revisions and results, but only if it was started from the same plan, survey,
+        # objective, and constraints. Otherwise a fresh manager run per attempt: a rerun must
+        # never mix in metrics or reflections from an earlier attempt's variants.
         arw.set_project_root(root)
-        manager_run_id = _resumable_manager_run(root, run_id)
+        followup = followup.strip()
+        manager_run_id = _resumable_manager_run(root, run_id, digest, steering=bool(followup))
         resume = manager_run_id is not None
         if manager_run_id is None:
             attempt = 1 + len(_attempt_dirs(root, run_id))
             manager_run_id = f"tyche-{run_id}-a{attempt}"
+            if followup:
+                constraints = [*constraints, f"Operator instruction: {followup}"]
+        _record_attempt(root, manager_run_id, digest)
         with model_environment(self.subject):
             arw.set_project_root(root)
             terminal = await runtime.arun(
@@ -409,10 +495,11 @@ class OpenJiuwenEngine:
                 topic=plan.working_title,
                 research_paths=["inputs/research_summary.md", "inputs/research_plan.md"],
                 run_id=manager_run_id,
-                objective=objective_text(plan, self.settings),
-                constraints=[str(c) for c in self.settings.get("constraints") or []],
+                objective=objective,
+                constraints=constraints,
                 initial_prompt=plan_markdown(plan),
                 task_mode="create_new_paper",
+                followup=followup if resume else "",
             )
         results = arw.results_dir(manager_run_id)
         variants = read_metrics_dir(results) if results.is_dir() else {}
@@ -438,6 +525,7 @@ class OpenJiuwenEngine:
             notes=f"manager run {manager_run_id}: terminal status={getattr(terminal, 'status', '?')} "
             f"reason={getattr(terminal, 'failure_reason', '') or getattr(terminal, 'abort_reason', '')}"
             + (f"; ignored stale variants: {', '.join(stale)}" if stale else ""),
+            attempt_dir=arw.workspace_dir(manager_run_id),
         )
 
 
@@ -454,15 +542,48 @@ def _attempt_dirs(root: Path, run_id: str) -> list[Path]:
     return [path for _, path in sorted(found)]
 
 
-def _resumable_manager_run(root: Path, run_id: str) -> str | None:
-    """The latest attempt's manager run id if it was interrupted before reaching a terminal state."""
+# Which inputs each manager attempt was started from (Tyche's file, beside openjiuwen's experiments/).
+_ATTEMPTS_FILE = "tyche_attempts.json"
+
+
+def inputs_digest(plan_md: str, summary: str, objective: str, constraints: list[str]) -> str:
+    """Identity of the inputs an experiment attempt works from."""
+    digest = hashlib.sha256()
+    for part in (plan_md, summary, objective, *constraints):
+        digest.update(part.encode("utf-8") + b"\0")
+    return digest.hexdigest()[:16]
+
+
+def _recorded_attempts(root: Path) -> dict[str, str]:
+    try:
+        data = json.loads((root / _ATTEMPTS_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+
+
+def _record_attempt(root: Path, manager_run_id: str, digest: str) -> None:
+    recorded = _recorded_attempts(root)
+    recorded[manager_run_id] = digest
+    (root / _ATTEMPTS_FILE).write_text(json.dumps(recorded, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _resumable_manager_run(
+    root: Path, run_id: str, digest: str | None = None, *, steering: bool = False
+) -> str | None:
+    """The latest attempt's manager run id if it was interrupted before reaching a terminal state
+    (or, when an operator is ``steering`` it, also if it finished) and was started from the same
+    inputs (``digest``). An attempt recorded under other inputs, e.g. before a re-plan, is left as it
+    is; one with no record predates the record and is resumed."""
     from openjiuwen.rsi.artifact_rsi.paper_opt.auto_research.modules.manager.artifacts import try_load_state
 
     attempts = _attempt_dirs(root, run_id)
     if not attempts:
         return None
     state = try_load_state(attempts[-1].name)
-    if state is None or getattr(state, "terminal", None) is not None:
+    if state is None or (getattr(state, "terminal", None) is not None and not steering):
+        return None
+    if digest is not None and _recorded_attempts(root).get(attempts[-1].name, digest) != digest:
         return None
     return attempts[-1].name
 

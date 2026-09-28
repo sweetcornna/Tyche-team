@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Any
 
 from tyche import STAGES, __version__
+from tyche.agent import AgentAuthor, AgentSettings, Materials, PaperDesk
+from tyche.agent.inbox import DELIVERED, INBOX, OperatorInbox, list_messages
 from tyche.analysis import analyze, build_registry, comparison_table, results_brief, results_figure, results_table
 from tyche.analysis.registry import NumberRegistry
 from tyche.config import TycheConfig
@@ -30,9 +32,10 @@ from tyche.paper.compose import PaperComposer
 from tyche.paper.latex import compile_pdf
 from tyche.paper.statements import ai_use_statement, reproducibility_statement
 from tyche.paper.writer import SectionWriter, WritingContext
-from tyche.planning import ResearchPlan, make_plan, plan_markdown
+from tyche.planning import PlannerAgent, ResearchPlan, make_plan, plan_markdown
 from tyche.review import FindingsLedger, ReviewPanel, RevisionLoop
 from tyche.textutil import sanitize_untrusted, truncate_tokens
+from tyche.trace import capture_environment, claim_map_for_run
 from tyche.workspace import StageError, Workspace, sha256_file, utcnow, write_json_atomic
 
 
@@ -60,6 +63,7 @@ class Pipeline:
         *,
         allow_gate_failures: bool = False,
         operator_notes: str = "",
+        experiment_followup: str = "",
         skill_export_dir: Path | None = None,
         echo=print,
     ):
@@ -70,8 +74,12 @@ class Pipeline:
         self.direction = direction
         self.allow_gate_failures = allow_gate_failures
         self.operator_notes = operator_notes
+        self.experiment_followup = experiment_followup.strip()
         self.skill_export_dir = skill_export_dir
         self.echo = echo
+        self.svc.meter.sink = self.ws.run_dir / "usage.jsonl"
+        # Messages the operator sends while the run works, delivered to the planner and author agents.
+        self.inbox = OperatorInbox(self.ws.run_dir, stage=lambda: self.svc.meter.stage, log=self.log)
 
     # -- helpers -------------------------------------------------------
     def log(self, kind: str, **fields: Any) -> None:
@@ -83,6 +91,22 @@ class Pipeline:
 
     def plan(self) -> ResearchPlan:
         return ResearchPlan.model_validate(self.ws.load_json("plan"))
+
+    @property
+    def agents(self) -> AgentSettings:
+        return AgentSettings.from_config(self.cfg.get("agents") or {"enabled": False})
+
+    def _agents_dir(self, stage: str, *, clear: bool = False) -> Path:
+        path = self.ws.stage_dir(stage) / "agents"
+        if clear:
+            shutil.rmtree(path, ignore_errors=True)
+        return path
+
+    def _save_transcripts(self, stage: str, inputs: list[str]) -> None:
+        """Keep the agents' transcripts of a stage in the run record (their builds are scratch)."""
+        transcripts = self._agents_dir(stage) / "transcripts"
+        if transcripts.is_dir() and any(transcripts.iterdir()):
+            self.ws.save_tree("agent_transcripts", transcripts, stage=stage, inputs=inputs)
 
     async def run(self, *, stop_after: str | None = None, only: str | None = None) -> dict[str, Any]:
         if stop_after and stop_after not in STAGES:
@@ -111,11 +135,13 @@ class Pipeline:
         return self.ws.state
 
     def _flush_usage(self) -> None:
-        """Append this process's model usage to the run's usage log, so resumed runs keep totals."""
+        """Append this process's model usage to the run's usage log, so resumed runs keep totals.
+        With the meter's sink on that log, each record is already there and only memory is freed."""
         path = self.ws.run_dir / "usage.jsonl"
-        with path.open("a", encoding="utf-8") as handle:
-            for rec in self.svc.meter.records:
-                handle.write(json.dumps(rec.__dict__, ensure_ascii=False) + "\n")
+        if self.svc.meter.sink != path:
+            with path.open("a", encoding="utf-8") as handle:
+                for rec in self.svc.meter.records:
+                    handle.write(json.dumps(rec.__dict__, ensure_ascii=False) + "\n")
         self.svc.meter.records.clear()
 
     def usage_summary(self) -> dict[str, Any]:
@@ -132,6 +158,17 @@ class Pipeline:
     # -- S0 plan -------------------------------------------------------
     async def stage_plan(self) -> dict[str, Any]:
         self.memory.retire_run_items(self.run_id, ["plan"])
+        agents = self.agents
+        planner = None
+        if agents.enabled and agents.planner_tools:
+            planner = PlannerAgent(
+                agents,
+                searchers=list(self.svc.searchers),
+                max_variants=int(self.cfg.get("experiments.max_variants", 4)),
+                transcript=self._agents_dir("plan", clear=True) / "transcripts" / "planner.jsonl",
+                log=self.log,
+                inbox=self.inbox,
+            )
         plan, manifest = await make_plan(
             self.svc.planner,
             topic=self.ws.state["topic"],
@@ -140,10 +177,19 @@ class Pipeline:
             run_id=self.run_id,
             budget=int(self.cfg.get("memory.context_budgets.plan", 6000)),
             operator_notes=self.operator_notes,
+            agent=planner,
         )
-        rec = self.ws.save_json("plan", plan.model_dump(), stage="plan")
+        # Operator notes steer the plan, so they belong in the run record next to it.
+        inputs = (
+            [self.ws.save_text("operator_notes", self.operator_notes, stage="plan").id]
+            if self.operator_notes.strip()
+            else []
+        )
+        rec = self.ws.save_json("plan", plan.model_dump(), stage="plan", inputs=inputs)
         self.ws.save_text("plan_md", plan_markdown(plan), stage="plan", inputs=[rec.id])
         write_json_atomic(self.ws.stage_dir("plan") / "context_manifest.json", manifest)
+        if planner is not None:
+            self._save_transcripts("plan", [rec.id])
         return {"method": plan.method_name, "title": plan.working_title}
 
     # -- S1 survey -----------------------------------------------------
@@ -174,10 +220,20 @@ class Pipeline:
     async def stage_experiments(self) -> dict[str, Any]:
         plan = self.plan()
         work = self.ws.stage_dir("experiments") / "engine"
+        if self.experiment_followup:
+            # An operator instruction to the experiment agents is part of how the results came about.
+            rec = self.ws.save_text("experiment_followup", self.experiment_followup, stage="experiments")
+            self.log("experiments.followup", artifact=rec.id)
         outcome = await self.svc.engine.run(
-            plan, summary_path=self.ws.latest_path("research_summary"), work_dir=work, run_id=self.run_id
+            plan,
+            summary_path=self.ws.latest_path("research_summary"),
+            work_dir=work,
+            run_id=self.run_id,
+            followup=self.experiment_followup,
         )
         self.ws.save_json("experiments", outcome.summary(), stage="experiments")
+        if outcome.attempt_dir is not None and outcome.attempt_dir.is_dir():
+            self._save_agent_usage(outcome.attempt_dir, work)
         if outcome.status != "completed" or len(outcome.variants) < 2:
             raise StageError(
                 f"experiments did not complete ({outcome.engine}): {outcome.notes}. No paper is written without "
@@ -195,6 +251,29 @@ class Pipeline:
             self.ws.save_file("reflection", path, stage="experiments", inputs=inputs)
         self.ws.set_meta(experiment_engine=outcome.engine, synthetic=outcome.synthetic)
         return {"engine": outcome.engine, "variants": sorted(outcome.variants), "synthetic": outcome.synthetic}
+
+    def _save_agent_usage(self, attempt_dir: Path, work: Path) -> None:
+        """Keep the openjiuwen agents' traces of this attempt, and their model usage, in the run record.
+
+        Saved whether or not the attempt succeeded: a failed attempt consumed tokens too.
+        """
+        from tyche.experiments.bridge import collect_agent_traces, openjiuwen_usage
+
+        staging = work / "agent_traces"
+        shutil.rmtree(staging, ignore_errors=True)
+        if collect_agent_traces(attempt_dir, staging):
+            traces = self.ws.save_tree("experiment_traces", staging, stage="experiments")
+            usage = openjiuwen_usage(staging / attempt_dir.name)
+            self.ws.save_json("experiment_usage", usage, stage="experiments", inputs=[traces.id])
+
+    def agent_usage(self) -> dict[str, int] | None:
+        """Model usage of openjiuwen's experiment agents over every attempt this run recorded."""
+        from tyche.experiments.bridge import agent_usage_totals
+
+        records = sorted((r for r in self.ws.records() if r.name == "experiment_usage"), key=lambda r: r.version)
+        if not records:
+            return None
+        return agent_usage_totals(json.loads((self.ws.run_dir / r.path).read_text(encoding="utf-8")) for r in records)
 
     def _check_failed_items(self, variants: dict[str, dict[str, Any]]) -> None:
         """Stop when too many items failed to run: their scores would measure failures, not methods."""
@@ -339,6 +418,7 @@ class Pipeline:
             "has_intervals": _has_intervals(analysis),
             "has_paired_tests": bool(analysis.get("comparisons")),
             "sources": list(self.cfg.get("literature.sources") or ["arxiv", "semantic_scholar", "openalex"]),
+            "operator_messages": sum(1 for m in list_messages(self.ws.run_dir) if m["status"] == "delivered"),
         }
 
     def _figure_caption(self) -> str:
@@ -364,16 +444,36 @@ class Pipeline:
         # The author conversation (system prompt and history) must leave room for one more
         # turn of up to ``budget`` tokens, instructions, and the reply.
         history = spec.context_window - (spec.max_tokens or 8192) - budget - 4000
-        writer = SectionWriter(
-            self.svc.writer,
-            memory=self.memory,
-            contracts=contracts,
-            budget=budget,
-            max_history_tokens=max(16000, history),
-            evidence_limit=int(self.cfg.get("memory.evidence_per_section", 12)),
-            lessons_limit=int(self.cfg.get("memory.lessons_per_section", 5)),
-            manifest_dir=self.ws.stage_dir(stage) / "context_manifests",
-        )
+        agents = self.agents
+        writer: SectionWriter | AgentAuthor
+        if agents.enabled:
+            writer = AgentAuthor(
+                self.svc.writer,
+                memory=self.memory,
+                contracts=contracts,
+                settings=agents,
+                work_dir=self._agents_dir(stage),
+                # Room for the history: the window less one reply and a margin for the next message.
+                context_tokens=max(32000, spec.context_window - (spec.max_tokens or 8192) - 4000),
+                evidence_limit=int(self.cfg.get("memory.evidence_per_section", 12)),
+                lessons_limit=int(self.cfg.get("memory.lessons_per_section", 5)) + 3,
+                materials=Materials(self._design_text(), self._reflection_text()),
+                helper_llm=self.svc.reviewer,
+                manifest_dir=self.ws.stage_dir(stage) / "context_manifests",
+                log=self.log,
+                inbox=self.inbox,
+            )
+        else:
+            writer = SectionWriter(
+                self.svc.writer,
+                memory=self.memory,
+                contracts=contracts,
+                budget=budget,
+                max_history_tokens=max(16000, history),
+                evidence_limit=int(self.cfg.get("memory.evidence_per_section", 12)),
+                lessons_limit=int(self.cfg.get("memory.lessons_per_section", 5)),
+                manifest_dir=self.ws.stage_dir(stage) / "context_manifests",
+            )
         figure = self.ws.latest_path("fig_results") if self.ws.latest("fig_results") else None
         floats = self.ws.latest_path("table_main").read_text(encoding="utf-8")
         if figure is not None:
@@ -420,6 +520,8 @@ class Pipeline:
     # -- S4 write --------------------------------------------------------
     async def stage_write(self) -> dict[str, Any]:
         shutil.rmtree(self.ws.stage_dir("write") / "context_manifests", ignore_errors=True)
+        # An interrupted author session left its autosave; keep it (and its transcript) to resume from.
+        self._agents_dir("write", clear=not (self._agents_dir("write") / "author_session.json").exists())
         ctx, _ = self._writing_context()
         composer = self._composer(ctx, "write")
         await composer.draft()
@@ -435,11 +537,13 @@ class Pipeline:
         state = composer.writer.export_state()
         if state is not None:
             self.ws.save_json("author_conversation", state, stage="write", inputs=inputs)
+        self._save_transcripts("write", inputs)
         return {"title": composer.title, "words": sum(len(s.split()) for s in composer.sections.values())}
 
     # -- S5 review -------------------------------------------------------
     async def stage_review(self) -> dict[str, Any]:
         shutil.rmtree(self.ws.stage_dir("review") / "context_manifests", ignore_errors=True)
+        agents_dir = self._agents_dir("review", clear=True)
         ctx, manifest = self._writing_context()
         composer = self._composer(ctx, "review")
         draft = self.ws.load_json("draft")
@@ -449,12 +553,23 @@ class Pipeline:
             resumed = composer.writer.import_state(self.ws.load_json("author_conversation"), ctx)
             self.log("review.author_conversation", resumed=resumed)
         review_cfg = dict(self.cfg.get("review") or {})
+        agents = self.agents
+        reviewer_tools = None
+        if agents.enabled and agents.reviewer_tools:
+            # Reviewers read the draft under review (the composer's current sections) but never edit it.
+            reader = PaperDesk(composer, self.memory, self.run_id, agents_dir / "reader_builds",
+                               Materials(self._design_text(), self._reflection_text()))
+            reviewer_tools = [t for t in reader.read_tools() if t.name != "paper_status" and t.name != "lint"]
         panel = ReviewPanel(
             self.svc.reviewer,
             reviewers=list(review_cfg.get("reviewers") or ["rigor", "positioning", "clarity"]),
             samples=int(review_cfg.get("samples_per_reviewer", 1)),
             budget=int(self.cfg.get("memory.context_budgets.review", 24000)),
             auditor=bool(review_cfg.get("auditor", True)),
+            tools=reviewer_tools,
+            agent_settings=agents,
+            transcripts=agents_dir / "transcripts",
+            log=self.log,
         )
         ledger = FindingsLedger(reflag_cap=int(review_cfg.get("reflag_cap", 2)))
         uncited = self._uncited_related(manifest, ctx)
@@ -513,6 +628,7 @@ class Pipeline:
         )
         if result.best_review is not None:
             self.ws.save_json("review_scores", result.best_review.to_dict(), stage="review", inputs=inputs)
+        self._save_transcripts("review", inputs)
         injected = self._injected_lesson_ids()
         self.ws.set_meta(injected_lessons=sorted(injected))
         return {
@@ -663,6 +779,17 @@ class Pipeline:
         shutil.copy2(self.ws.latest_path("ledger"), out / "review_ledger.json")
         shutil.copy2(self.ws.run_dir / gates_rec.path, out / "gates.json")
         self._copy_run_record(out / "run_record")
+        # Audit views shipped with the paper: the environment it was packaged in, and the claim-evidence
+        # map of the packaged text. The map is a reader's view, not a gate; the gates above decide release.
+        write_json_atomic(out / "environment.json", capture_environment(config=self.cfg))
+        claims_error = None
+        try:
+            claims = claim_map_for_run(self.ws.run_dir)
+        except Exception as exc:  # noqa: BLE001 - a bug in the audit view must not hide a gated paper
+            claims, claims_error = None, f"{type(exc).__name__}: {exc}"[:500]
+            self.ws.event("package.claims_failed", error=claims_error)
+        if claims is not None:
+            write_json_atomic(out / "claims.json", claims)
         drift = self.ws.verify_provenance()
         provenance = {
             "tyche_version": __version__,
@@ -675,11 +802,16 @@ class Pipeline:
             "artifacts": [r.__dict__ for r in self.ws.records()],
             "drifted_artifacts": drift,
             "paper_pdf_sha256": sha256_file(pdf),
+            "claims": claims["stats"] if claims else None,
+            "claims_error": claims_error,
         }
         write_json_atomic(out / "provenance.json", provenance)
-        report = self._run_report(gates)
+        report = self._run_report(gates, claims["stats"] if claims else None)
         (out / "run_report.md").write_text(report, encoding="utf-8")
-        return {"pdf": str(pdf), "verified": verified, "drifted": len(drift)}
+        info: dict[str, Any] = {"pdf": str(pdf), "verified": verified, "drifted": len(drift)}
+        if claims:
+            info["claims"] = {k: claims["stats"][k] for k in ("claims", "verified", "weak", "unverified")}
+        return info
 
     def _copy_run_record(self, target: Path) -> None:
         """The run record promised by the reproducibility statement: every artifact version plus
@@ -694,12 +826,12 @@ class Pipeline:
             for extra in list(stage_dir.glob("*.json")):
                 (target / stage).mkdir(parents=True, exist_ok=True)
                 shutil.copy2(extra, target / stage / extra.name)
-        for name in ("state.json", "events.jsonl", "usage.jsonl", "provenance.jsonl", "config.json"):
+        for name in ("state.json", "events.jsonl", "usage.jsonl", "provenance.jsonl", "config.json", INBOX, DELIVERED):
             path = self.ws.run_dir / name
             if path.exists():
                 shutil.copy2(path, target / name)
 
-    def _run_report(self, gates: dict[str, Any]) -> str:
+    def _run_report(self, gates: dict[str, Any], claims: dict[str, Any] | None = None) -> str:
         state = self.ws.state
         rounds = self.ws.load_json("review_rounds") if self.ws.latest("review_rounds") else []
         self._flush_usage()
@@ -714,6 +846,21 @@ class Pipeline:
             f"- Gates: {'PASSED' if gates.get('passed') else 'FAILED -- UNVERIFIED PAPER'}",
             f"- Main-text pages: {gates.get('stats', {}).get('main_pages')}",
             f"- Distinct citations: {gates.get('stats', {}).get('distinct_citations')}",
+        ]
+        messages = list_messages(self.ws.run_dir)
+        if messages:
+            delivered = sum(1 for m in messages if m["status"] == "delivered")
+            lines.append(
+                f"- Operator messages: {len(messages)} sent, {delivered} delivered to agents "
+                f"(run_record/{INBOX}, run_record/{DELIVERED})"
+            )
+        if claims:
+            lines.append(
+                f"- Claim-evidence map (claims.json): {claims['claims']} claims, {claims['verified']} verified, "
+                f"{claims['weak']} weakly supported, {claims['unverified']} unverified; "
+                f"{claims['numbers_matched']}/{claims['numbers']} numbers matched to computed values"
+            )
+        lines += [
             "",
             "## Review rounds",
             "",
@@ -731,7 +878,9 @@ class Pipeline:
             "",
         ]
         for stage, row in state.get("stages", {}).items():
-            lines.append(f"- {stage}: {row.get('status')}")
+            # This report is written by the package stage itself, which is finishing now.
+            status = "this package" if stage == "package" else row.get("status")
+            lines.append(f"- {stage}: {status}")
         lines += ["", "## Model usage", "", f"- Total: {usage['total']}"]
         profiles = {
             role: getattr(getattr(self.svc, role), "profile", None) for role in ("planner", "writer", "reviewer")
@@ -742,6 +891,9 @@ class Pipeline:
         )
         for stage, row in usage["by_stage"].items():
             lines.append(f"- {stage}: {row}")
+        agents = self.agent_usage()
+        if agents:
+            lines.append(f"- openJiuwen experiment agents (from their agent traces): {agents}")
         if gates.get("findings"):
             lines += ["", "## Remaining gate findings", ""]
             for f in gates["findings"]:

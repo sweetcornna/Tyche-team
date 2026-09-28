@@ -16,12 +16,13 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from statistics import mean
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-from tyche.llm import LLMClient, complete_json
+from tyche.llm import LLMClient, LLMError, complete_json, schema_hint
 from tyche.prompts import load_prompt
 from tyche.textutil import truncate_tokens
 
@@ -154,6 +155,10 @@ class ReviewPanel:
         samples: int = 1,
         budget: int = 24000,
         auditor: bool = True,
+        tools: list | None = None,
+        agent_settings=None,
+        transcripts: Path | None = None,
+        log=None,
     ):
         unknown = [r for r in reviewers if r not in PERSONAS]
         if unknown:
@@ -163,6 +168,60 @@ class ReviewPanel:
         self.samples = max(1, samples)
         self.budget = budget
         self.auditor = auditor
+        # Read-only paper tools: with them, each reviewer and the auditor is an agent session that can
+        # check numbers and cited evidence before reporting (see tyche.agent); without them, one call each.
+        self.tools = list(tools or [])
+        self.agent_settings = agent_settings
+        self.transcripts = transcripts
+        self.log = log or (lambda *a, **k: None)
+        self._round = 0
+
+    async def _ask(self, system: str, task: str, schema: type[BaseModel], purpose: str) -> BaseModel:
+        """One reviewer's report: from an agent session with tools when configured, else one call."""
+        if not self.tools:
+            return await complete_json(self.llm, system=system, user=task, schema=schema, purpose=purpose)
+        from tyche.agent.session import AgentSession
+        from tyche.agent.tools import Tool, ToolResult
+
+        class SubmitArgs(BaseModel):
+            report: dict = Field(description="Your report as one JSON object.")
+
+        def submit(args: SubmitArgs) -> ToolResult:
+            try:
+                report = schema.model_validate(args.report)
+            except Exception as exc:  # noqa: BLE001 - validation errors go back to the reviewer
+                return ToolResult(f"the report does not validate: {str(exc)[:1500]}", ok=False)
+            return ToolResult("report received", data=report)
+
+        settings = self.agent_settings
+        role = purpose.split(":", 1)[-1]
+        session = AgentSession(
+            self.llm,
+            name=f"reviewer_{role}",
+            # Identical for every reviewer and the auditor, so the provider caches the paper once.
+            instructions=load_prompt("review_common") + "\n\n" + load_prompt("agent_reviewer"),
+            tools=[*self.tools, Tool("submit", "Submit your report; it ends your task. The report must validate "
+                                     "against the schema in your task.", submit, SubmitArgs, effect="result",
+                                     ends_session=True)],
+            policy=settings.policy("read_only") if settings else None,
+            context=system,
+            purpose=f"agent:{purpose}",
+            max_turns=settings.turns("review") if settings else 6,
+            transcript=self.transcripts / f"round{self._round}_{role}.jsonl" if self.transcripts else None,
+            log=self.log,
+        )
+        outcome = await session.run(
+            task + "\n\n<output_schema>\n" + schema_hint(schema) + "\n</output_schema>\nCheck what you need with "
+            "the tools, then call submit with the report."
+        )
+        if outcome.result is not None:
+            return outcome.result
+        # The session ended without a valid report; ask once more without tools rather than lose the review.
+        self.log("review.agent_fallback", reviewer=role, status=outcome.status)
+        try:
+            return await complete_json(self.llm, system=system, user=task, schema=schema, purpose=purpose)
+        except LLMError as exc:
+            raise LLMError(f"reviewer {role} produced no valid report ({outcome.status}): {exc}") from exc
 
     async def review(
         self,
@@ -175,6 +234,7 @@ class ReviewPanel:
         cited_evidence: dict[str, str],
         experiment_reflection: str = "",
     ) -> PanelRound:
+        self._round += 1
         paper = truncate_tokens(paper_text, int(self.budget * 0.7))
         squashed = _squash(paper_text) + _squash(" ".join(sections.values()))
         prior = [
@@ -205,15 +265,14 @@ class ReviewPanel:
             for sample in range(self.samples):
                 name = persona if self.samples == 1 else f"{persona}#{sample + 1}"
                 # Instructions precede the lens, so they are cached for every persona after the first.
-                out = await complete_json(
-                    self.llm,
-                    system=shared,
-                    user=load_prompt("review_system")
+                out = await self._ask(
+                    shared,
+                    load_prompt("review_system")
                     + "\n\n<reviewer_lens>\n"
                     + PERSONAS[persona]
                     + "\n</reviewer_lens>\nReview the paper through this lens.",
-                    schema=ReviewOutput,
-                    purpose=f"review:{persona}",
+                    ReviewOutput,
+                    f"review:{persona}",
                 )
                 reviews[name] = out.model_dump()
                 for dim in DIMENSIONS:
@@ -239,9 +298,7 @@ class ReviewPanel:
             )
             if experiment_reflection:
                 audit_user += "\n<experiment_reflection>\n" + experiment_reflection + "\n</experiment_reflection>"
-            audit = await complete_json(
-                self.llm, system=shared, user=audit_user, schema=AuditOutput, purpose="review:auditor"
-            )
+            audit = await self._ask(shared, audit_user, AuditOutput, "review:auditor")
             kept, lost = normalize_findings(audit.findings, "auditor", squashed)
             findings += kept
             dropped += lost

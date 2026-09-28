@@ -28,12 +28,28 @@ async def test_selftest_end_to_end_and_resume(tmp_path):
     assert all(row["status"] == "done" for row in state["stages"].values())
     manifests = list((run_dir / "write" / "context_manifests").glob("*.json"))
     assert manifests and all("budget" in json.loads(m.read_text()) for m in manifests)
+    # Plan, write, and review ran as agent sessions; their transcripts are part of the run record.
+    transcripts = {p.name for p in run_dir.glob("*/agents/transcripts/*.jsonl")}
+    assert {"planner.jsonl", "author.jsonl", "fact_checker_01.jsonl", "round1_rigor.jsonl"} <= transcripts
+    assert (run_dir / "package" / "run_record" / "artifacts" / "agent_transcripts").is_dir()
+    events = [json.loads(line)["kind"] for line in (run_dir / "events.jsonl").read_text().splitlines()]
+    assert {"agent.tool", "agent.todos", "agent.build", "agent.delegate", "agent.stop_blocked"} <= set(events)
     report = (run_dir / "package" / "run_report.md").read_text()
     assert "SYNTHETIC FIXTURE" in report
     provenance = json.loads((run_dir / "package" / "provenance.json").read_text())
     names = {a["name"] for a in provenance["artifacts"]}
     assert {"plan", "refs_bib", "experiment_results", "analysis", "draft", "paper_pdf", "ledger"} <= names
     assert Path(summary["pdf"]).exists()
+
+
+@needs_latex
+async def test_selftest_with_the_one_call_per_section_writer(tmp_path):
+    summary = await run_selftest(root=tmp_path, echo=lambda *a: None, agents=False)
+    assert summary["ok"], summary
+    run_dir = tmp_path / "runs" / "selftest"
+    assert not (run_dir / "write" / "agents").exists()
+    manifests = list((run_dir / "write" / "context_manifests").glob("*.json"))
+    assert len(manifests) >= 7 and all("budget" in json.loads(m.read_text()) for m in manifests)
 
 
 @needs_latex
@@ -159,3 +175,211 @@ def test_resume_keeps_the_run_config_and_rejects_mismatched_reuse(tmp_path, monk
     code = cli.main(["run", "--workspace", str(root), "--run-id", "r1", "--resume-if-exists",
                      "--topic", "topic B", "--direction", "memory_engine"])
     assert code == 2 and "different topic" in capsys.readouterr().err
+
+
+async def test_plan_stage_records_operator_notes(tmp_path):
+    from tyche.config import TycheConfig, load_direction
+    from tyche.llm import ScriptedLLM, UsageMeter
+    from tyche.memory import MemoryStore
+    from tyche.pipeline import Pipeline, Services
+    from tyche.selftest import handlers
+    from tyche.workspace import Workspace
+
+    meter = UsageMeter()
+    services = Services(planner=ScriptedLLM(handlers(), meter=meter), writer=None, reviewer=None, searchers=[],
+                        verifier=None, s2=None, engine=None, meter=meter)
+    for run_id, notes in (("with-notes", "Avoid ceiling effects.\n"), ("without-notes", "")):
+        meter.records.clear()
+        ws = Workspace.create(tmp_path, run_id, topic="t", direction="memory_engine", config_digest="x")
+        pipe = Pipeline(TycheConfig.load(env={}), ws, services, MemoryStore(tmp_path / "memory.db"),
+                        load_direction("memory_engine"), echo=lambda *a: None, operator_notes=notes)
+        await pipe.stage_plan()
+        # Each model call is in the run's usage log as soon as it is made, not when the stage ends,
+        # so a process killed mid-stage keeps its accounting.
+        rows = (ws.run_dir / "usage.jsonl").read_text(encoding="utf-8").splitlines()
+        assert rows and [json.loads(row)["purpose"] for row in rows] == [r.purpose for r in meter.records]
+        pipe._flush_usage()
+        assert len((ws.run_dir / "usage.jsonl").read_text(encoding="utf-8").splitlines()) == len(rows)
+        if notes:
+            assert ws.latest_path("operator_notes").read_text(encoding="utf-8") == notes
+            assert ws.latest("plan").inputs == [ws.latest("operator_notes").id]
+        else:
+            assert ws.latest("operator_notes") is None and ws.latest("plan").inputs == []
+
+
+def test_resume_from_stage_continues_and_keeps_operator_notes(tmp_path, monkeypatch):
+    import tyche.cli as cli
+    import tyche.pipeline as pipeline_module
+    from tyche import STAGES
+    from tyche.workspace import Workspace, write_json_atomic
+
+    root = tmp_path / "ws"
+    ws = Workspace.create(root, "r1", topic="topic A", direction="memory_engine", config_digest="x")
+    write_json_atomic(ws.run_dir / "config.json", cli._config(cli.build_parser().parse_args(["run"])).data)
+    ws.save_text("operator_notes", "Keep the history over budget.\n", stage="plan")
+    for stage in STAGES:
+        ws.mark_stage(stage, "done")
+    calls = []
+
+    class FakeHttp:
+        async def aclose(self):
+            return None
+
+    class FakePipeline:
+        def __init__(self, config, workspace, *args, operator_notes="", **kwargs):
+            self.notes = operator_notes
+
+        async def run(self, *, stop_after=None, only=None):
+            calls.append({"notes": self.notes, "stop_after": stop_after, "only": only})
+            return {}
+
+    monkeypatch.setattr(cli, "build_services", lambda config: (None, FakeHttp()))
+    monkeypatch.setattr(pipeline_module, "Pipeline", FakePipeline)
+    base = ["run", "--workspace", str(root), "--run-id", "r1", "--resume"]
+    assert cli.main([*base, "--from-stage", "write"]) == 0
+    assert calls[-1] == {"notes": "Keep the history over budget.\n", "stop_after": None, "only": None}
+    assert [Workspace.open(root, "r1").stage_status(s) for s in STAGES] == ["done"] * 4 + ["pending"] * 4
+    assert cli.main([*base, "--from-stage", "plan", "--stop-after", "plan", "--notes", "Use three baselines."]) == 0
+    assert calls[-1] == {"notes": "Use three baselines.", "stop_after": "plan", "only": None}
+    assert cli.main([*base, "--stage", "write", "--from-stage", "write"]) == 2
+
+
+@needs_latex
+async def test_verify_passes_on_a_package_and_catches_tampering(tmp_path):
+    import shutil
+
+    from tyche.trace.verify import verify_package
+
+    summary = await run_selftest(root=tmp_path, echo=lambda *a: None)
+    assert summary["ok"] and all(summary["verify"].values()), summary["verify"]
+    package = tmp_path / "runs" / "selftest" / "package"
+    assert main(["verify", str(package.parent)]) == 0  # a run directory is accepted too
+
+    # Edited experiment metrics: the hashes and the recomputed statistics both catch it.
+    edited = tmp_path / "edited"
+    shutil.copytree(package, edited)
+    metrics = sorted((edited / "run_record" / "artifacts" / "experiment_results").glob("*/*.metrics.json"))[0]
+    data = json.loads(metrics.read_text())
+    rows = data["per_question"]
+    key = next(k for k in ("correct", "exact_match", "success") if k in rows[0])
+    rows[0][key] = not rows[0][key]
+    metrics.write_text(json.dumps(data))
+    failed = {c.name for c in verify_package(edited) if not c.ok}
+    assert {"provenance", "analysis"} <= failed
+
+    # A number edited into the paper source no longer matches any computed value.
+    retouched = tmp_path / "retouched"
+    shutil.copytree(package, retouched)
+    abstract = retouched / "paper_source" / "sections" / "abstract.tex"
+    abstract.write_text(abstract.read_text() + " Accuracy improves by 0.987.")
+    failed = {c.name for c in verify_package(retouched) if not c.ok}
+    assert "paper numbers" in failed and "analysis" not in failed
+    assert main(["verify", str(retouched)]) == 1
+
+
+async def test_experiment_followup_is_recorded_and_passed_to_the_engine(tmp_path):
+    from tyche.experiments import ExperimentOutcome
+    from tyche.selftest import PLAN
+    from tyche.workspace import StageError, Workspace
+
+    ws = Workspace.create(tmp_path, "r", topic="t", direction="memory_engine", config_digest="x")
+    ws.save_json("plan", PLAN, stage="plan")
+    ws.save_text("research_summary", "## Short Summary\nx\n", stage="survey")
+    seen = {}
+
+    class Engine:
+        name = "fake"
+
+        async def run(self, plan, *, summary_path, work_dir, run_id, followup=""):
+            seen["followup"] = followup
+            return ExperimentOutcome("failed", "fake", {}, notes="stopped for the test")
+
+    pipe = _pipeline(tmp_path, ws, experiment_followup="  Calibrate difficulty first.  ")
+    pipe.svc.engine = Engine()
+    with pytest.raises(StageError):
+        await pipe.stage_experiments()
+    assert seen["followup"] == "Calibrate difficulty first."
+    assert ws.load_text("experiment_followup") == "Calibrate difficulty first."
+    assert any(e.get("kind") == "experiments.followup" for e in map(json.loads, (ws.run_dir / "events.jsonl").read_text().splitlines()))
+
+
+@needs_latex
+async def test_an_interrupted_draft_resumes_its_agent_session(tmp_path):
+    """A write stage that dies mid-draft (e.g. the gateway keeps dropping requests) resumes where it stopped."""
+    from tyche.config import TycheConfig, load_direction
+    from tyche.experiments import fixture_engine
+    from tyche.fixtures.literature import mock_transport
+    from tyche.literature import build_clients
+    from tyche.llm import ScriptedLLM, UsageMeter
+    from tyche.memory import MemoryStore
+    from tyche.pipeline import Pipeline, Services
+    from tyche.selftest import PLAN, handlers
+    from tyche.workspace import Workspace
+
+    config = TycheConfig.load(
+        overrides=[f"workspace.root={tmp_path}", "experiments.engine=fixture", "literature.min_papers=4"], env={}
+    )
+    meter = UsageMeter()
+    llm = ScriptedLLM(handlers(), meter=meter)
+    literature = dict(config.get("literature"))
+    literature["min_interval_seconds"] = {}
+    http, searchers, verifier, s2 = build_clients(literature, cache_path=None, env={}, transport=mock_transport())
+    ws = Workspace.create(tmp_path, "r", topic=PLAN["working_title"], direction="memory_engine", config_digest="x")
+    memory = MemoryStore(tmp_path / "memory.db")
+    services = Services(planner=llm, writer=llm, reviewer=llm, searchers=searchers, verifier=verifier, s2=s2,
+                        engine=fixture_engine(), meter=meter)
+    pipeline = Pipeline(config, ws, services, memory, load_direction("memory_engine"), echo=lambda *a: None)
+    try:
+        await pipeline.run(stop_after="analysis")
+        author = llm.handlers["agent:author"]
+        turns = {"n": 0}
+
+        def flaky(system, user, history):
+            turns["n"] += 1
+            if turns["n"] == 4:
+                raise ConnectionError("the gateway dropped the request")
+            return author(system, user, history)
+
+        llm.handlers["agent:author"] = flaky
+        with pytest.raises(ConnectionError):
+            await pipeline.run(stop_after="write")
+        saved_path = ws.stage_dir("write") / "agents" / "author_session.json"
+        saved = json.loads(saved_path.read_text())
+        assert [n for n, b in saved["sections"].items() if b.strip()] == ["method", "experiments", "analysis"]
+
+        seen = []
+
+        def resumed(system, user, history):
+            reply = author(system, user, history)
+            seen.append((user, len(history), reply))
+            return reply
+
+        llm.handlers["agent:author"] = resumed
+        await pipeline.run(stop_after="write")
+        first_user, first_history, first_reply = seen[0]
+        assert first_history == len(saved["session"]["turns"])
+        assert first_user.startswith('<result call="1" tool="update_todos"') and "has been resumed" in first_user
+        assert not saved_path.exists() and ws.stage_status("write") == "done"
+        # The resumed session went on with the next section instead of starting over.
+        assert '<call tool="write_section">\n<arg name="section">\nrelated_work' in first_reply
+        transcript = (ws.stage_dir("write") / "agents" / "transcripts" / "author.jsonl").read_text()
+        assert transcript.count('"kind": "task"') == 2  # the interrupted task and the resumed one, in one file
+        events = [json.loads(line)["kind"] for line in (ws.run_dir / "events.jsonl").read_text().splitlines()]
+        assert "agent.resumed" in events
+    finally:
+        await http.aclose()
+        memory.close()
+
+
+def test_message_command_queues_and_lists_operator_messages(tmp_path, capsys):
+    import tyche.cli as cli
+    from tyche.workspace import Workspace
+
+    root = tmp_path / "ws"
+    Workspace.create(root, "r1", topic="t", direction="memory_engine", config_digest="x")
+    base = ["message", "--workspace", str(root), "--run-id", "r1"]
+    assert cli.main([*base, "Report the call counts per variant."]) == 0
+    assert "queued message" in capsys.readouterr().out
+    assert cli.main(base) == 0
+    listing = capsys.readouterr().out
+    assert "queued" in listing and "Report the call counts per variant." in listing

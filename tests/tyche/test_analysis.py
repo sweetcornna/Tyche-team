@@ -147,3 +147,182 @@ def test_constant_metrics_are_ordered_after_informative_ones():
     }
     result = analyze(variants, plan_metrics=["accuracy"], resamples=100, permutations=100)
     assert result.metrics == ["accuracy", "historical_accuracy", "call_budget_envelope"]
+
+
+def test_pilot_rows_failed_items_and_flag_subsets_are_selected_jointly():
+    """Rows carry a variant-specific id, a pilot phase, failed calls, and a changed-target flag.
+
+    The reported metrics use evaluation rows only, skip failed calls, and compute the stale rate
+    over changed-target queries; one rule must reproduce every variant, and pairing uses pair_id.
+    """
+
+    def rows(method, correct, stale):
+        out = []
+        for k in range(12):
+            changed = k % 2 == 0
+            out.append({
+                "id": f"s1:q{k}:{method}", "pair_id": f"s1:q{k}", "phase": "eval", "changed_target": changed,
+                "exact_match": bool(correct[k]), "stale_fact": bool(stale[k]) and changed,
+                "prompt_tokens": 100 + k + (50 if method == "proposed" else 0), "error": None,
+            })
+        out.append({"id": f"p:q0:{method}", "pair_id": "p:q0", "phase": "pilot", "changed_target": True,
+                    "exact_match": False, "stale_fact": True, "prompt_tokens": 999, "error": None})
+        out.append({"id": f"s1:q99:{method}", "pair_id": "s1:q99", "phase": "eval", "changed_target": True,
+                    "exact_match": False, "stale_fact": False, "prompt_tokens": None, "error": "timeout"})
+        return out
+
+    good = rows("proposed", [1] * 12, [0] * 12)
+    base = rows("baseline", [1, 0] * 6, [1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+
+    def summary(items):
+        scored = [i for i in items if i["phase"] == "eval" and not i["error"]]
+        changed = [i for i in scored if i["changed_target"]]
+        return {
+            "exact_match_accuracy": sum(i["exact_match"] for i in scored) / len(scored),
+            "stale_fact_rate": sum(i["stale_fact"] for i in changed) / len(changed),
+            "mean_prompt_tokens": sum(i["prompt_tokens"] for i in scored) / len(scored),
+            "per_question": items,
+        }
+
+    variants = {"proposed": summary(good), "baseline": summary(base)}
+    plan = ["Exact-match accuracy on the latest value.", "Stale_fact_rate on changed-target queries: fraction stale.",
+            "Prompt tokens per query, from the API."]
+    result = analyze(variants, plan_metrics=plan, resamples=200, permutations=200)
+    assert result.metrics[:3] == ["exact_match_accuracy", "stale_fact_rate", "mean_prompt_tokens"]
+    assert not any("planned metrics" in note for note in result.notes)
+    stale = result.variants["baseline"]["stale_fact_rate"]
+    assert stale.n == 6 and abs(stale.mean - 2 / 6) < 1e-9
+    assert result.variants["proposed"]["stale_fact_rate"].n == 6  # the same subset, although every row is 0
+    assert result.variants["proposed"]["exact_match_accuracy"].n == 12
+    by_metric = {c.metric: c for c in result.comparisons}
+    assert by_metric["exact_match_accuracy"].n == 12 and abs(by_metric["exact_match_accuracy"].diff - 0.5) < 1e-9
+    assert by_metric["stale_fact_rate"].n == 6
+    assert abs(by_metric["mean_prompt_tokens"].diff - 50) < 1e-9
+
+
+def test_planned_metric_descriptions_map_to_reported_names():
+    from tyche.analysis.stats import map_planned_metrics
+
+    reported = {"exact_match_accuracy", "stale_fact_rate", "stale_fact_rate_update", "mean_prompt_tokens", "accuracy"}
+    mapping = map_planned_metrics(
+        ["Stale_fact_rate on changed-target queries; report updates separately.", "Exact-match accuracy.",
+         "Prompt tokens per query", "Latency in seconds"],
+        reported,
+    )
+    assert mapping == {
+        "Stale_fact_rate on changed-target queries; report updates separately.": "stale_fact_rate",
+        "Exact-match accuracy.": "exact_match_accuracy",
+        "Prompt tokens per query": "mean_prompt_tokens",
+    }
+
+
+def test_ceiling_effects_and_ties_are_reported():
+    from tyche.analysis import results_brief
+
+    def rows(flags):
+        return [{"id": f"q{i}", "correct": bool(f)} for i, f in enumerate(flags)]
+
+    variants = {
+        "proposed": {"accuracy": 1.0, "per_question": rows([1] * 6)},
+        "oracle": {"accuracy": 1.0, "per_question": rows([1] * 6)},
+        "weak": {"accuracy": 0.5, "per_question": rows([1, 0] * 3)},
+    }
+    result = analyze(variants, plan_metrics=["accuracy"], resamples=100, permutations=100)
+    assert any("ceiling/floor" in n and "oracle, proposed" in n for n in result.notes)
+    brief = results_brief(result)
+    assert "accuracy vs oracle" in brief and "a tie" in brief
+    assert "accuracy vs weak" in brief and "favors proposed" in brief
+
+
+def test_a_floor_reached_with_and_without_failed_rows_withholds_n():
+    """Every row scores 0, so the reported 0.0 fits 10 rows or the 7 scored ones: n is unknown."""
+
+    def rows():
+        return [{"pair_id": f"q{i}", "correct": False, "error": "timeout" if i < 3 else None} for i in range(10)]
+
+    variants = {"proposed": {"accuracy": 0.0, "per_question": rows()}, "baseline": {"accuracy": 0.0, "per_question": rows()}}
+    result = analyze(variants, plan_metrics=["accuracy"], resamples=100, permutations=100)
+    assert result.variants["proposed"]["accuracy"].n == 0 and result.variants["proposed"]["accuracy"].ci_low is None
+    assert not result.comparisons
+    assert any("several different item sets" in n and "accuracy" in n for n in result.notes)
+    assert any("ceiling/floor" in n and "baseline, proposed" in n for n in result.notes)
+
+
+def test_reproduction_is_exact_for_full_precision_values():
+    """20 correct of 288 is 0.0694; 20 of the 285 scored rows is within 1e-3 of it but is not the reported value."""
+
+    def rows(correct):
+        return [
+            {"pair_id": f"q{i}", "correct": i < correct, "error": "timeout" if i >= 285 else None} for i in range(288)
+        ]
+
+    variants = {
+        "proposed": {"accuracy": 20 / 288, "per_question": rows(20)},
+        "baseline": {"accuracy": 10 / 288, "per_question": rows(10)},
+    }
+    result = analyze(variants, plan_metrics=["accuracy"], resamples=100, permutations=100)
+    assert result.variants["proposed"]["accuracy"].n == 288
+    assert result.comparisons[0].n == 288
+    # A value stored with four decimals is rounded, not exact, and still reproduces.
+    variants["proposed"]["accuracy"] = 0.0694
+    rounded = analyze(variants, plan_metrics=["accuracy"], resamples=100, permutations=100)
+    assert rounded.variants["proposed"]["accuracy"].n == 288
+
+
+def test_exact_match_rate_is_read_from_per_item_correctness():
+    def variant(flags):
+        return {"exact_match": sum(flags) / len(flags), "per_question": [
+            {"id": f"seed{i}:heldout:rep{i}", "correct": bool(f)} for i, f in enumerate(flags)
+        ]}
+
+    variants = {"proposed": variant([1, 1, 1, 1, 1, 1, 1, 0]), "baseline": variant([1, 0, 0, 1, 0, 0, 1, 0])}
+    result = analyze(variants, plan_metrics=["exact_match"], resamples=100, permutations=100)
+    assert result.variants["proposed"]["exact_match"].n == 8
+    [comp] = result.comparisons
+    assert comp.n == 8 and abs(comp.diff - 0.5) < 1e-9
+
+
+def test_variants_reported_over_different_rows_are_not_paired():
+    def rows(correct):
+        return [
+            {"pair_id": f"q{i}", "phase": "eval" if i < 8 else "pilot", "correct": bool(c)} for i, c in enumerate(correct)
+        ]
+
+    a = rows([1, 1, 1, 1, 1, 1, 0, 0, 0, 0])  # evaluation rows: 6/8
+    b = rows([1, 1, 0, 0, 0, 0, 0, 0, 1, 1])  # all rows: 4/10 (evaluation rows alone: 2/8)
+    variants = {"proposed": {"accuracy": 6 / 8, "per_question": a}, "baseline": {"accuracy": 4 / 10, "per_question": b}}
+    result = analyze(variants, plan_metrics=["accuracy"], resamples=100, permutations=100)
+    assert result.variants["proposed"]["accuracy"].n == 8 and result.variants["baseline"]["accuracy"].n == 10
+    assert not result.comparisons
+    assert any("over different item sets" in n and "not compared pairwise" in n for n in result.notes)
+
+
+def test_each_interval_depends_only_on_its_own_data():
+    def rows(flags, tokens):
+        return [{"pair_id": f"q{i}", "correct": bool(f), "tokens": t} for i, (f, t) in enumerate(zip(flags, tokens))]
+
+    flags_a, flags_b = [1, 1, 0, 1, 1, 0, 1, 1], [1, 0, 0, 1, 0, 0, 1, 0]
+    tokens = [10, 12, 9, 14, 11, 13, 10, 12]
+
+    def variant(flags, with_tokens):
+        out = {"accuracy": sum(flags) / len(flags), "per_question": rows(flags, tokens)}
+        if with_tokens:
+            out["mean_tokens"] = sum(tokens) / len(tokens)
+        return out
+
+    alone = analyze({"proposed": variant(flags_a, False), "baseline": variant(flags_b, False)}, plan_metrics=["accuracy"])
+    both = analyze({"proposed": variant(flags_a, True), "baseline": variant(flags_b, True)}, plan_metrics=["mean_tokens", "accuracy"])
+    def pick(result):
+        return next(c for c in result.comparisons if c.metric == "accuracy")
+
+    assert (pick(alone).ci_low, pick(alone).ci_high, pick(alone).p_value) == (pick(both).ci_low, pick(both).ci_high, pick(both).p_value)
+    assert alone.variants["proposed"]["accuracy"].ci_low == both.variants["proposed"]["accuracy"].ci_low
+
+
+def test_planned_setting_like_metrics_named_in_prose_are_kept():
+    variants = {
+        "proposed": {"accuracy": 0.5, "max_prompt_tokens": 900.0},
+        "baseline": {"accuracy": 0.4, "max_prompt_tokens": 1400.0},
+    }
+    result = analyze(variants, plan_metrics=["Accuracy on held-out items", "Max prompt tokens over all queries"])
+    assert result.metrics[:2] == ["accuracy", "max_prompt_tokens"]

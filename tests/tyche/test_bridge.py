@@ -220,6 +220,25 @@ def test_interrupted_manager_attempt_is_resumed(tmp_path, monkeypatch):
     assert _resumable_manager_run(tmp_path, "other") is None
 
 
+def test_an_attempt_interrupted_before_a_replan_is_not_resumed(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from openjiuwen.rsi.artifact_rsi.paper_opt.auto_research.modules.manager import artifacts
+
+    from tyche.experiments.bridge import _record_attempt, _resumable_manager_run, inputs_digest
+
+    (tmp_path / "experiments" / "tyche-r1-a1").mkdir(parents=True)
+    monkeypatch.setattr(artifacts, "try_load_state", lambda run_id: SimpleNamespace(terminal=None))
+    old = inputs_digest("plan v1", "summary", "objective", ["c"])
+    new = inputs_digest("plan v2", "summary", "objective", ["c"])
+    assert old != new
+    # An attempt from before inputs were recorded is resumed as before.
+    assert _resumable_manager_run(tmp_path, "r1", new) == "tyche-r1-a1"
+    _record_attempt(tmp_path, "tyche-r1-a1", old)
+    assert _resumable_manager_run(tmp_path, "r1", old) == "tyche-r1-a1"
+    assert _resumable_manager_run(tmp_path, "r1", new) is None
+
+
 
 async def test_code_round_that_changes_nothing_is_retried_with_a_host_instruction(tmp_path, monkeypatch):
     from openjiuwen.rsi.artifact_rsi.paper_opt.auto_research.common import workspace as arw
@@ -263,3 +282,55 @@ def test_planned_metrics_are_never_mistaken_for_settings():
         "max_context_tokens": 512.0,
         "n_hallucinations": 3.0,
     }
+
+
+async def test_operator_followup_steers_the_latest_attempt_even_after_it_finished(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from openjiuwen.rsi.artifact_rsi.paper_opt.auto_research.modules.experiment_design import agent as design_mod
+    from openjiuwen.rsi.artifact_rsi.paper_opt.auto_research.modules.manager import agent as manager_mod
+    from openjiuwen.rsi.artifact_rsi.paper_opt.auto_research.modules.manager.schemas import TerminalReport
+    from openjiuwen.rsi.artifact_rsi.paper_opt.auto_research.modules.reflection import agent as reflection_mod
+    from openjiuwen.rsi.artifact_rsi.paper_opt.auto_research.pipeline import manager as runtime_mod
+
+    from tyche.experiments import bridge
+
+    calls = []
+
+    class FakeRuntime:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def arun(self, **kwargs):
+            calls.append(kwargs)
+            (tmp_path / "exp" / "experiments" / kwargs["run_id"]).mkdir(parents=True, exist_ok=True)
+            return TerminalReport(status="complete", run_id=kwargs["run_id"], completion_satisfied=True)
+
+    Dummy = type("Dummy", (), {"__init__": lambda self, *a, **k: None})
+    monkeypatch.setattr(manager_mod, "ManagerAgent", Dummy)
+    monkeypatch.setattr(design_mod, "ExperimentDesignAgent", Dummy)
+    monkeypatch.setattr(reflection_mod, "ReflectionAgent", Dummy)
+    monkeypatch.setattr(runtime_mod, "ManagerRuntime", FakeRuntime)
+    monkeypatch.setattr(bridge, "_latest_execution_variants", lambda run_id: set())
+    finished = SimpleNamespace(terminal=object())
+    from openjiuwen.rsi.artifact_rsi.paper_opt.auto_research.modules.manager import artifacts
+
+    monkeypatch.setattr(artifacts, "try_load_state", lambda run_id: finished)
+    monkeypatch.setenv("API_KEY", "test-key")
+    spec = TycheConfig.load(env={"MODEL_NAME": "m"}).model("experiments")
+    summary = tmp_path / "summary.md"
+    summary.write_text("## Short Summary\nx\n")
+    engine = OpenJiuwenEngine(object(), spec, {"constraints": ["small"]})
+    plan = ResearchPlan.model_validate(PLAN)
+
+    # A fresh attempt carries the instruction as a constraint (there is no manager state to steer).
+    await engine.run(plan, summary_path=summary, work_dir=tmp_path / "exp", run_id="r1", followup="Make it harder.")
+    assert calls[0]["run_id"] == "tyche-r1-a1" and calls[0]["resume"] is False and calls[0]["followup"] == ""
+    assert calls[0]["constraints"] == ["small", "Operator instruction: Make it harder."]
+    # Without an instruction, the finished attempt is left alone and a new one starts.
+    await engine.run(plan, summary_path=summary, work_dir=tmp_path / "exp", run_id="r1")
+    assert calls[1]["run_id"] == "tyche-r1-a2" and calls[1]["resume"] is False
+    # With one, the latest finished attempt is reopened through openjiuwen's resume steering.
+    await engine.run(plan, summary_path=summary, work_dir=tmp_path / "exp", run_id="r1", followup="Calibrate first.")
+    assert calls[2]["run_id"] == "tyche-r1-a2" and calls[2]["resume"] is True
+    assert calls[2]["followup"] == "Calibrate first." and calls[2]["constraints"] == ["small"]

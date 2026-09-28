@@ -24,11 +24,19 @@ cd "$ROOT"
 
 command -v uv >/dev/null || { echo "uv is required: https://docs.astral.sh/uv/" >&2; exit 1; }
 
+# GNU timeout is not part of macOS; use coreutils' gtimeout there, or run unbounded.
+with_timeout() {
+  if command -v timeout >/dev/null; then timeout "$@"
+  elif command -v gtimeout >/dev/null; then gtimeout "$@"
+  else shift; "$@"
+  fi
+}
+
 REQS="$(mktemp -t tyche-reqs.XXXXXX.txt)"
 trap 'rm -f "$REQS"' EXIT
 uv export --frozen --no-hashes --no-emit-project --extra test > "$REQS"
 
-if timeout 20 git ls-remote https://gitcode.com/openJiuwen/agent-core.git HEAD >/dev/null 2>&1; then
+if with_timeout 20 git ls-remote https://gitcode.com/openJiuwen/agent-core.git HEAD >/dev/null 2>&1; then
   echo "[tyche] gitcode.com reachable; using upstream pins as-is"
 else
   echo "[tyche] gitcode.com unreachable; using GitHub mirrors of the same commits"
@@ -39,7 +47,7 @@ else
   rm -f "$REQS.bak"
 fi
 
-if grep -q "gitcode.com" "$REQS" && ! timeout 20 git ls-remote https://gitcode.com/openJiuwen/agent-core.git HEAD >/dev/null 2>&1; then
+if grep -q "gitcode.com" "$REQS" && ! with_timeout 20 git ls-remote https://gitcode.com/openJiuwen/agent-core.git HEAD >/dev/null 2>&1; then
   echo "[tyche] unresolved gitcode requirement remains:" >&2
   grep "gitcode.com" "$REQS" >&2
   exit 1
@@ -55,26 +63,18 @@ uv pip install --no-deps -r "$REQS"
 uv pip install --no-deps -e .
 uv pip install "ruff>=0.11.2"
 
-# openjiuwen's experiment coding agent reads the SDK reference docs from
-# <site-packages>/docs (agent-core's docs/ tree), which a pip install does not ship.
-# Fetch exactly the pinned commit's docs/ so generated experiment code is grounded.
-SITE="$("$VENV_DIR/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
-if [[ ! -d "$SITE/docs/en" ]]; then
-  PIN="$(grep -o 'agent-core.git@[0-9a-f]\{40\}' pyproject.toml | head -1 | cut -d@ -f2)"
-  DOCS_TMP="$(mktemp -d -t tyche-agentcore-docs.XXXXXX)"
-  for REMOTE in https://gitcode.com/openJiuwen/agent-core.git https://github.com/openJiuwen-ai/agent-core.git; do
-    if git -C "$DOCS_TMP" init -q 2>/dev/null \
-      && git -C "$DOCS_TMP" remote add origin "$REMOTE" 2>/dev/null \
-      && timeout 300 git -C "$DOCS_TMP" fetch -q --depth 1 --filter=blob:none origin "$PIN" \
-      && git -C "$DOCS_TMP" sparse-checkout set docs \
-      && git -C "$DOCS_TMP" checkout -q FETCH_HEAD; then
-      rm -rf "$SITE/docs" && mv "$DOCS_TMP/docs" "$SITE/docs"
-      echo "[tyche] installed openjiuwen reference docs ($PIN) from $REMOTE"
-      break
-    fi
-    rm -rf "$DOCS_TMP" && DOCS_TMP="$(mktemp -d -t tyche-agentcore-docs.XXXXXX)"
-  done
-  rm -rf "$DOCS_TMP"
-  [[ -d "$SITE/docs/en" ]] || echo "[tyche] warning: could not fetch openjiuwen reference docs" >&2
+# openjiuwen's experiment coding agent reads the SDK reference docs from <site-packages>/docs,
+# which a pip install does not ship; fetch exactly the pinned commit's docs/.
+PIN="$(grep -o 'agent-core.git@[0-9a-f]\{40\}' pyproject.toml | head -1 | cut -d@ -f2)"
+scripts/tyche/fetch_openjiuwen_docs.sh "$VENV_DIR/bin/python" "$PIN"
+# The `tyche ui` web app ships as a prebuilt bundle in tyche/web/frontend/dist; build it when Node is available.
+if command -v npm >/dev/null; then
+  if npm --prefix tyche/web/frontend ci --no-audit --no-fund >/dev/null && npm --prefix tyche/web/frontend run build >/dev/null; then
+    echo "[tyche] built the web app (tyche ui)"
+  else
+    echo "[tyche] warning: could not build the web app; tyche ui will show build instructions" >&2
+  fi
+else
+  echo "[tyche] npm not found; skipped the web app build (tyche ui needs Node.js 20+ once)" >&2
 fi
 echo "[tyche] environment ready: source $VENV_DIR/bin/activate"

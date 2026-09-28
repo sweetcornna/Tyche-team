@@ -20,6 +20,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol, TypeVar
 
 from pydantic import BaseModel, ValidationError
@@ -87,24 +88,29 @@ class UsageMeter:
     stage: str = ""
     # Shared by every client of a run, so roles that share a model route share prefixes.
     ledger: cache.PrefixLedger = field(default_factory=cache.PrefixLedger)
+    # A JSONL file each record is appended to as soon as it is made, so a process that is
+    # killed mid-stage (an agent session can run for an hour) still leaves its accounting.
+    sink: Path | None = None
 
     def add(self, purpose: str, reply: LLMReply) -> None:
-        self.records.append(
-            UsageRecord(
-                purpose=purpose,
-                stage=self.stage,
-                model=reply.model,
-                input_tokens=reply.input_tokens,
-                output_tokens=reply.output_tokens,
-                latency_s=round(reply.latency_s, 3),
-                cached_tokens=reply.cached_tokens,
-                cache_write_tokens=reply.cache_write_tokens,
-                cache_reported=reply.cache_reported,
-                est_prompt_tokens=reply.est_prompt_tokens,
-                est_reusable_tokens=reply.est_reusable_tokens,
-                cache_break=reply.cache_break,
-            )
+        record = UsageRecord(
+            purpose=purpose,
+            stage=self.stage,
+            model=reply.model,
+            input_tokens=reply.input_tokens,
+            output_tokens=reply.output_tokens,
+            latency_s=round(reply.latency_s, 3),
+            cached_tokens=reply.cached_tokens,
+            cache_write_tokens=reply.cache_write_tokens,
+            cache_reported=reply.cache_reported,
+            est_prompt_tokens=reply.est_prompt_tokens,
+            est_reusable_tokens=reply.est_reusable_tokens,
+            cache_break=reply.cache_break,
         )
+        self.records.append(record)
+        if self.sink is not None:
+            with self.sink.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record.__dict__, ensure_ascii=False) + "\n")
 
     @staticmethod
     def _row(records: list[UsageRecord]) -> dict[str, Any]:
@@ -148,6 +154,27 @@ class LLMClient(Protocol):
         history: list[dict[str, str]] | None = None,
         continues: bool = False,
     ) -> LLMReply: ...
+
+
+# Transport failures worth repeating: the request never reached the model or the endpoint was
+# briefly unable to serve it. Anything else (bad request, auth, content errors) fails at once.
+_TRANSIENT = re.compile(
+    r"APIConnectionError|Connection error|APITimeoutError|timed out|ReadTimeout|ConnectTimeout|RemoteProtocolError|"
+    r"RateLimitError|InternalServerError|ServiceUnavailable|(?:error code|status(?: code)?|HTTP)[:=\s]*(?:429|50[0234])\b",
+    re.I,
+)
+TRANSPORT_RETRY_DELAYS = (5.0, 20.0, 60.0, 120.0)
+
+
+def is_transient(exc: BaseException) -> bool:
+    """Whether an exception (or one it was raised from) is a transient transport failure."""
+    seen = 0
+    current: BaseException | None = exc
+    while current is not None and seen < 5:
+        if _TRANSIENT.search(f"{type(current).__name__}: {current}"):
+            return True
+        current, seen = current.__cause__ or current.__context__, seen + 1
+    return False
 
 
 class OpenJiuwenLLM:
@@ -205,12 +232,24 @@ class OpenJiuwenLLM:
         return self._model
 
     async def _invoke(self, model: Any, messages: list[dict[str, Any]], hints: dict[str, Any], temperature, max_tokens):
-        return await model.invoke(
-            messages,
-            temperature=temperature if temperature is not None else self.spec.temperature,
-            max_tokens=max_tokens or self.spec.max_tokens,
-            **hints,
-        )
+        """One model request, repeated with backoff while the failure is a transient transport error."""
+        for attempt, delay in enumerate((*TRANSPORT_RETRY_DELAYS, None)):
+            try:
+                return await model.invoke(
+                    messages,
+                    temperature=temperature if temperature is not None else self.spec.temperature,
+                    max_tokens=max_tokens or self.spec.max_tokens,
+                    **hints,
+                )
+            except Exception as exc:
+                if delay is None or not is_transient(exc):
+                    raise
+                log.warning(
+                    "%s (%s) request failed with a transient error (attempt %d); retrying in %.0f s: %s",
+                    self.spec.role, self.spec.model_name, attempt + 1, delay, type(exc).__name__,
+                )
+                await asyncio.sleep(delay)
+        raise AssertionError("unreachable")
 
     async def complete(
         self,

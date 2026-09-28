@@ -189,6 +189,8 @@ tyche = [
     "prompts/*.md",
     "paper/template/*",
     "fixtures/experiment_results/*",
+    "web/frontend/dist/**/*",
+    "web/frontend/dist/*",
 ]
 
 [tool.setuptools.exclude-package-data]
@@ -197,6 +199,10 @@ jiuwenswarm = [
     "channels/web/frontend/node_modules/*",
     "resources/agent/workspace/skills/project-maintainer/**/*",
     "resources/agent/workspace/skills/project-maintainer/*",
+]
+tyche = [
+    "web/frontend/node_modules/**",
+    "web/frontend/node_modules/*",
 ]
 
 [tool.uv]

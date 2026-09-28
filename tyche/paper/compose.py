@@ -51,7 +51,7 @@ class BuildResult:
 class PaperComposer:
     def __init__(
         self,
-        writer: SectionWriter,
+        writer: "SectionWriter | Any",
         ctx: WritingContext,
         *,
         bib_path: Path,
@@ -92,9 +92,16 @@ class PaperComposer:
         self.sections: dict[str, str] = {}
         self.removed: dict[str, list[str]] = {}
         self.title = ctx.plan.working_title
+        if hasattr(writer, "bind"):
+            # An agent author works on this composer's draft through tools.
+            writer.bind(self)
 
     # -- drafting ------------------------------------------------------
     async def draft(self) -> None:
+        if hasattr(self.writer, "draft_paper"):
+            # An agent author writes, checks, and titles the whole paper in one session.
+            await self.writer.draft_paper(self)
+            return
         for name in WRITE_ORDER:
             draft = await self.writer.write(name, self.ctx, self.sections)
             self.sections[name] = draft.latex
@@ -129,12 +136,14 @@ class PaperComposer:
             return result, main_text_pages(result.pdf), pdf_text(result.pdf)
         return result, 0, ""
 
-    async def build(self, build_dir: Path) -> BuildResult:
+    async def build(self, build_dir: Path, *, auto_fix: bool = True) -> BuildResult:
+        """Compile and gate the draft. With ``auto_fix``, the writer first repairs compile errors and
+        shortens the paper to the page limit; an agent's own build tool turns that off and fixes them itself."""
         repairs: list[str] = []
         trims: list[str] = []
         result, main_pages, text = self._compile(build_dir)
         attempts = 0
-        while not result.ok and attempts < self.repair_attempts:
+        while auto_fix and not result.ok and attempts < self.repair_attempts:
             attempts += 1
             err = result.errors[0] if result.errors else None
             target = None
@@ -150,7 +159,7 @@ class PaperComposer:
                 break
             result, main_pages, text = self._compile(build_dir)
         tries = 0
-        while result.ok and main_pages > self.max_main_pages and tries < self.trim_attempts:
+        while auto_fix and result.ok and main_pages > self.max_main_pages and tries < self.trim_attempts:
             tries += 1
             ratio = self.max_main_pages / max(main_pages, 1)
             candidates = sorted(

@@ -216,3 +216,45 @@ async def test_removing_gate_blockers_beats_a_higher_score(tmp_path):
     result = await loop.run()
     assert result.rounds[1]["accepted"] is True
     assert result.best.gates.passed
+
+
+async def test_a_revision_that_drops_a_structural_requirement_is_rejected(tmp_path):
+    from tyche.gates import GateFinding
+    from tyche.review import RevisionLoop
+
+    finding = dict(section="analysis", severity="major", dimension="claims_supported", source="rigor",
+                   quote="gains concentrate on questions", problem="Overclaims.", fix="Narrow.",
+                   close_criterion="Narrowed.")
+    reviews = iter([_round(5.0, [finding]), _round(5.6)])
+
+    async def review_fn(build, prior):
+        return next(reviews)
+
+    current, candidate = _build(True, []), _build(True, [])
+    candidate.gates.findings.append(GateFinding("structure", "major", "analysis", "no limitations discussion"))
+    composer = _FakeComposer([current, candidate])
+    loop = RevisionLoop(composer, FindingsLedger(), review_fn, out_dir=tmp_path, max_rounds=1, target=9.0,
+                        tolerance=0.15, plateau_rounds=3, max_findings=8)
+    result = await loop.run()
+    assert result.rounds[1]["accepted"] is False
+    assert result.rounds[1]["regressions"] == ["structure/analysis: no limitations discussion"]
+    assert result.rounds[1]["composite"] is None  # rejected before spending a panel review
+    assert composer.sections == {"analysis": "draft 0.83"}
+
+
+async def test_an_existing_major_finding_with_new_counts_is_not_a_regression(tmp_path):
+    from tyche.gates import GateFinding
+    from tyche.review import RevisionLoop
+
+    reviews = iter([_round(5.0), _round(5.2)])
+
+    async def review_fn(build, prior):
+        return next(reviews)
+
+    current, candidate = _build(True, []), _build(True, [])
+    current.gates.findings.append(GateFinding("structure", "major", "analysis", "analysis has 812 words (max 600)"))
+    candidate.gates.findings.append(GateFinding("structure", "major", "analysis", "analysis has 700 words (max 600)"))
+    loop = RevisionLoop(_FakeComposer([current, candidate]), FindingsLedger(), review_fn, out_dir=tmp_path,
+                        max_rounds=1, target=9.0, tolerance=0.15, plateau_rounds=3, max_findings=8)
+    result = await loop.run()
+    assert result.rounds[1]["accepted"] is True and result.rounds[1]["regressions"] == []

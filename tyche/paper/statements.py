@@ -51,6 +51,11 @@ def ai_use_statement(meta: dict[str, Any], human_review: str, *, verified: bool 
         "record and every result number stated in the abstract, introduction, experiments, analysis, and "
         "conclusion to match the computed analysis."
     )
+    if meta.get("operator_messages"):
+        text += (
+            " While the pipeline ran, the operator sent instructions to the planning and writing agents; each "
+            "message and the point at which it was delivered are recorded in the run record."
+        )
     if verified is False:
         text += (
             " This version did not pass those gates and is released UNVERIFIED; the accompanying gate report "

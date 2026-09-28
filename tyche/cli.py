@@ -13,7 +13,7 @@ from typing import Any
 from tyche import STAGES, __version__
 from tyche.config import DIRECTIONS, ConfigError, TycheConfig, load_direction
 from tyche.llm import LLMError
-from tyche.workspace import StageError, Workspace, read_json, write_json_atomic
+from tyche.workspace import StageError, Workspace, check_run_id, read_json, write_json_atomic
 
 
 def _load_env_files() -> None:
@@ -21,8 +21,9 @@ def _load_env_files() -> None:
         from dotenv import load_dotenv
     except ImportError:  # pragma: no cover - python-dotenv ships with openjiuwen
         return
-    load_dotenv(Path.cwd() / ".env", override=False)
-    load_dotenv(Path.home() / ".jiuwenswarm" / "config" / ".env", override=False)
+    # Values are literal: no ${VAR} interpolation can copy one secret into another setting.
+    load_dotenv(Path.cwd() / ".env", override=False, interpolate=False)
+    load_dotenv(Path.home() / ".jiuwenswarm" / "config" / ".env", override=False, interpolate=False)
 
 
 def _config(args: argparse.Namespace, base: dict[str, Any] | None = None) -> TycheConfig:
@@ -75,16 +76,46 @@ def _save_run_config(ws: Workspace, config: TycheConfig) -> None:
     write_json_atomic(ws.run_dir / "config.json", config.data)
 
 
+def _lock_run(root: Path, run_id: str) -> Any:
+    """Hold an exclusive lock on one run for the life of this process, so two writers never share it."""
+    check_run_id(run_id)
+    lock_dir = root / ".locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    handle = (lock_dir / f"{run_id}.lock").open("a+")
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - Windows has no flock; the web UI still serializes its launches
+        return handle
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        raise ConfigError(f"run {run_id!r} is already running in another process") from None
+    return handle
+
+
 async def _cmd_run(args: argparse.Namespace) -> int:
+    locks: list[Any] = []
+    try:
+        return await _run(args, locks)
+    finally:
+        # Released however the run ends, not whenever its frame happens to be collected.
+        for handle in locks:
+            handle.close()
+
+
+async def _run(args: argparse.Namespace, locks: list[Any]) -> int:
     from tyche.memory import MemoryStore
     from tyche.pipeline import Pipeline
 
     config = _config(args)
     root = config.workspace_root()
     exists = bool(args.run_id) and (root / "runs" / str(args.run_id) / "state.json").exists()
-    if args.resume or (args.resume_if_exists and exists):
+    resumed = bool(args.resume or (args.resume_if_exists and exists))
+    if resumed:
         if not args.run_id:
             raise ConfigError("--resume needs --run-id")
+        locks.append(_lock_run(root, args.run_id))
         ws = Workspace.open(root, args.run_id)
         topic, direction = ws.state["topic"], ws.state["direction"]
         if (args.topic and args.topic != topic) or (args.direction and args.direction != direction):
@@ -96,8 +127,10 @@ async def _cmd_run(args: argparse.Namespace) -> int:
             _save_run_config(ws, config)
             ws.event("config.updated", digest=config.digest())
         services, http = build_services(config)
-        if args.stage:
-            ws.reset_from(args.stage)
+        if args.stage and args.from_stage:
+            raise ConfigError("use either --stage or --from-stage, not both")
+        if args.stage or args.from_stage:
+            ws.reset_from(args.stage or args.from_stage)
     else:
         if not args.topic or not args.direction:
             raise ConfigError("a new run needs --topic and --direction")
@@ -108,6 +141,7 @@ async def _cmd_run(args: argparse.Namespace) -> int:
         run_id = args.run_id or f"{datetime.now(timezone.utc):%Y%m%d-%H%M%S}-{slugify(args.topic, 32)}"
         topic, direction = args.topic, args.direction
         load_direction(direction)
+        locks.append(_lock_run(root, run_id))
         # Build services first so missing credentials fail before an empty run directory is created.
         services, http = build_services(config)
         ws = Workspace.create(root, run_id, topic=topic, direction=direction, config_digest=config.digest())
@@ -116,6 +150,13 @@ async def _cmd_run(args: argparse.Namespace) -> int:
     if args.notes:
         path = Path(args.notes)
         notes = path.read_text(encoding="utf-8") if path.exists() else args.notes
+    elif resumed and ws.latest("operator_notes") is not None:
+        # A resumed run that replans keeps the notes it was planned with.
+        notes = ws.load_text("operator_notes")
+    followup = ""
+    if args.experiment_followup:
+        path = Path(args.experiment_followup)
+        followup = path.read_text(encoding="utf-8") if path.exists() else args.experiment_followup
     memory = MemoryStore(root / "memory.db")
     skill_dir = Path(args.export_skill_dir).expanduser() if args.export_skill_dir else None
     pipeline = Pipeline(
@@ -126,6 +167,7 @@ async def _cmd_run(args: argparse.Namespace) -> int:
         load_direction(direction),
         allow_gate_failures=args.allow_gate_failures,
         operator_notes=notes,
+        experiment_followup=followup,
         skill_export_dir=skill_dir,
     )
     try:
@@ -141,6 +183,24 @@ async def _cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_verify(args: argparse.Namespace) -> int:
+    from tyche.trace.verify import locate_package, report, verify_package
+
+    try:
+        package = locate_package(Path(args.package))
+    except FileNotFoundError as exc:
+        raise ConfigError(str(exc)) from None
+    checks = verify_package(package)
+    if args.json:
+        print(json.dumps(report(checks), indent=2, ensure_ascii=False))
+    else:
+        print(f"[tyche] verifying {package} (offline; no model calls)")
+        for check in checks:
+            print(f"  {'PASS' if check.ok else 'FAIL'}  {check.name:<14} {check.detail}")
+        print(f"verify: {'PASSED' if all(c.ok for c in checks) else 'FAILED'}")
+    return 0 if all(c.ok for c in checks) else 1
+
+
 def _cmd_status(args: argparse.Namespace) -> int:
     config = _config(args)
     root = config.workspace_root()
@@ -153,6 +213,21 @@ def _cmd_status(args: argparse.Namespace) -> int:
         return 0
     ws = Workspace.open(root, args.run_id)
     print(json.dumps(ws.state, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _cmd_message(args: argparse.Namespace) -> int:
+    from tyche.agent.inbox import list_messages, post_message
+
+    ws = Workspace.open(_config(args).workspace_root(), args.run_id)
+    if args.text:
+        record = post_message(ws.run_dir, args.text)
+        print(f"[tyche] queued message {record['id']}; it reaches the planner or author at its next turn")
+        return 0
+    for m in list_messages(ws.run_dir):
+        where = m["delivered"] or {}
+        state = f"delivered to {where.get('session')} ({where.get('stage')}, turn {where.get('turn')})" if where else "queued"
+        print(f"{m['at']}  {m['id']}  {state}\n    {m['text']}")
     return 0
 
 
@@ -191,8 +266,10 @@ async def _cmd_review(args: argparse.Namespace) -> int:
 async def _probe(url: str) -> str:
     import httpx
 
+    # Any HTTP answer, a redirect included, shows the host is reachable. Following redirects
+    # would report gateways that bounce a bare /v1 path (e.g. to /v1/) as unreachable.
     try:
-        async with httpx.AsyncClient(timeout=8, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=8, follow_redirects=False) as client:
             response = await client.get(url)
         return f"reachable (HTTP {response.status_code})"
     except Exception as exc:  # noqa: BLE001 - report any failure mode
@@ -285,6 +362,39 @@ async def _cmd_selftest(args: argparse.Namespace) -> int:
     return 0 if summary["ok"] else 1
 
 
+def _cmd_ui(args: argparse.Namespace) -> int:
+    from tyche.web.server import serve
+
+    import secrets
+
+    from tyche.web.server import LOOPBACK_HOSTS
+
+    config = _config(args)
+    root = config.workspace_root()
+    env_file = Path.cwd() / ".env"
+    token = None
+    if args.host.strip("[]") not in LOOPBACK_HOSTS:
+        if not args.allow_remote:
+            raise ConfigError(
+                f"--host {args.host} would let other machines start, stop and delete runs; pass --allow-remote "
+                "to serve beyond this machine behind a per-launch access token"
+            )
+        token = secrets.token_urlsafe(24)
+    url = f"http://{args.host}:{args.port}/" + (f"?token={token}" if token else "")
+    print(f"[tyche] serving {url} (workspace {root})")
+    serve(
+        root,
+        host=args.host,
+        port=args.port,
+        config_path=args.config,
+        overrides=list(getattr(args, "set", None) or []),
+        env_file=env_file,
+        open_browser=not args.no_browser,
+        token=token,
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="tyche", description="Evidence-bound ICLR short-paper agent on JiuwenSwarm")
     parser.add_argument("--version", action="version", version=f"tyche {__version__}")
@@ -310,15 +420,38 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--stage", choices=STAGES, help="with --resume: rerun exactly this stage and mark every later stage pending"
     )
+    run.add_argument(
+        "--from-stage",
+        choices=STAGES,
+        help="with --resume: rerun this stage and continue through every later stage (or --stop-after)",
+    )
     run.add_argument("--engine", choices=["openjiuwen", "imported", "fixture"], help="experiment engine")
     run.add_argument("--results-dir", help="with --engine imported: directory of <variant>.metrics.json files")
     run.add_argument("--notes", help="operator notes (text or a file path) for the planner")
+    run.add_argument(
+        "--experiment-followup",
+        help="operator instruction (text or a file path) for openJiuwen's experiment manager; it steers the "
+        "latest experiment attempt, reopening it if it had finished (use with --from-stage experiments)",
+    )
     run.add_argument("--allow-gate-failures", action="store_true", help="package even if gates fail (marked UNVERIFIED)")
     run.add_argument("--export-skill-dir", help="also write active lessons to this JiuwenSwarm skill directory")
 
     status = sub.add_parser("status", help="list runs or show one run's state")
     common(status)
     status.add_argument("--run-id")
+
+    message = sub.add_parser(
+        "message", help="send the running agents a message (delivered at their next turn), or list the messages"
+    )
+    common(message)
+    message.add_argument("--run-id", required=True)
+    message.add_argument("text", nargs="?", help="the message; omit it to list the run's messages and their delivery")
+
+    verify = sub.add_parser(
+        "verify", help="offline check of a packaged paper: hashes, recomputed statistics, numbers, citations, claims"
+    )
+    verify.add_argument("package", help="a package directory, or a run directory that contains package/")
+    verify.add_argument("--json", action="store_true", help="print the checks as JSON")
 
     review = sub.add_parser("review", help="simulated 7-dimension review of any paper PDF")
     common(review)
@@ -334,6 +467,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     selftest = sub.add_parser("selftest", help="offline end-to-end test with scripted models and fixtures")
     selftest.add_argument("--keep", help="copy the selftest PDF and report to this directory")
+
+    ui = sub.add_parser("ui", help="serve the local web UI (runs, stages, events, artifacts, papers)")
+    common(ui)
+    ui.add_argument("--host", default="127.0.0.1", help="bind address (default 127.0.0.1)")
+    ui.add_argument("--port", type=int, default=8765, help="bind port (default 8765)")
+    ui.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="allow a non-loopback --host; access then requires the token in the printed URL",
+    )
+    ui.add_argument("--no-browser", action="store_true", help="do not open a browser tab")
     return parser
 
 
@@ -345,6 +489,10 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(_cmd_run(args))
         if args.command == "status":
             return _cmd_status(args)
+        if args.command == "verify":
+            return _cmd_verify(args)
+        if args.command == "message":
+            return _cmd_message(args)
         if args.command == "review":
             return asyncio.run(_cmd_review(args))
         if args.command == "doctor":
@@ -353,6 +501,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_lessons(args)
         if args.command == "selftest":
             return asyncio.run(_cmd_selftest(args))
+        if args.command == "ui":
+            return _cmd_ui(args)
     except (ConfigError, StageError, LLMError) as exc:
         print(f"[tyche] error: {exc}", file=sys.stderr)
         return 2

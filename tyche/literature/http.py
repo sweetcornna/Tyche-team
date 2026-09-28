@@ -1,7 +1,8 @@
 """Polite, cached HTTP access for public scholarly APIs.
 
 * One minimum interval per host (arXiv asks for about 3 seconds).
-* Retries with exponential backoff on 429 and 5xx responses.
+* Retries with exponential backoff on 429 and 5xx responses, waiting at least as long as the
+  service asks (``Retry-After``, or OpenAlex's ``retryAfter`` field), up to ``max_wait``.
 * An SQLite response cache keyed by URL, so reruns and resumes do not hammer
   the APIs and a completed survey can be replayed offline.
 * An injectable ``httpx`` transport, which tests use to serve fixtures.
@@ -11,8 +12,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import sqlite3
 import time
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlencode, urlsplit
@@ -82,6 +85,7 @@ class HttpClient:
         contact_email: str = "",
         transport: httpx.AsyncBaseTransport | None = None,
         max_retries: int = 3,
+        max_wait: float = 90.0,
     ):
         agent = f"Tyche/{__version__} (research agent; +https://github.com/sweetcornna/Tyche"
         agent += f"; mailto:{contact_email})" if contact_email else ")"
@@ -94,6 +98,7 @@ class HttpClient:
         self.cache = ResponseCache(cache_path, cache_ttl_days)
         self.min_interval = dict(min_interval or {})
         self.max_retries = max_retries
+        self.max_wait = max_wait
         self._last: dict[str, float] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self.requests_made = 0
@@ -140,6 +145,7 @@ class HttpClient:
         last_detail = ""
         for attempt in range(self.max_retries + 1):
             await self._throttle(host)
+            asked = 0.0
             try:
                 response = await self._client.get(full, headers=headers)
             except httpx.HTTPError as exc:
@@ -157,12 +163,35 @@ class HttpClient:
                 if status == 404:
                     raise HttpError(public, status, "not found")
                 last_detail = _redact(response.text[:200], secrets)
+                if status == 406 and not last_detail.strip():
+                    # export.arxiv.org answers every uncached query this way while it throttles a host.
+                    last_detail = "refused with an empty body; the service may be throttling this host, retry later"
                 if status not in (429, 500, 502, 503, 504):
                     raise HttpError(public, status, last_detail)
+                asked = _retry_after(response)
             if attempt < self.max_retries:
-                await asyncio.sleep(delay)
+                await asyncio.sleep(min(max(delay, asked), self.max_wait))
                 delay *= 2
         raise HttpError(public, None, f"gave up after retries: {last_detail}")
+
+
+def _retry_after(response: httpx.Response) -> float:
+    """Seconds the service asked us to wait: a Retry-After header (seconds or HTTP date) or the
+    ``retryAfter`` field OpenAlex puts in its JSON error body; 0 when it asked for nothing."""
+    header = response.headers.get("retry-after", "").strip()
+    if header:
+        try:
+            return max(0.0, float(header))
+        except ValueError:
+            try:
+                return max(0.0, parsedate_to_datetime(header).timestamp() - time.time())
+            except (TypeError, ValueError):
+                pass
+    try:
+        value = json.loads(response.text).get("retryAfter")
+    except (ValueError, AttributeError):
+        return 0.0
+    return max(0.0, float(value)) if isinstance(value, (int, float)) else 0.0
 
 
 def _redact(text: str, secrets: dict[str, str]) -> str:

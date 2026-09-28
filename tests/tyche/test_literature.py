@@ -243,3 +243,40 @@ async def test_secret_query_params_stay_out_of_cache_and_errors(tmp_path):
         await http.aclose()
     dump = "\n".join(str(row) for row in sqlite3.connect(cache).iterdump())
     assert "sk-openalex-secret" not in dump  # ... and neither does the response cache.
+
+
+async def test_http_client_waits_as_long_as_the_service_asks(tmp_path, monkeypatch):
+    waits = []
+
+    async def fake_sleep(seconds):
+        waits.append(seconds)
+
+    monkeypatch.setattr("tyche.literature.http.asyncio.sleep", fake_sleep)
+    replies = iter(
+        [
+            httpx.Response(429, headers={"Retry-After": "12"}, text="slow down"),
+            httpx.Response(429, json={"error": "Rate limit exceeded", "retryAfter": 39}),
+            httpx.Response(503, headers={"Retry-After": "3600"}, text="maintenance"),
+            httpx.Response(200, text="ok"),
+        ]
+    )
+    http = HttpClient(
+        cache_path=tmp_path / "c.sqlite",
+        transport=httpx.MockTransport(lambda request: next(replies)),
+        max_retries=3,
+        max_wait=90,
+    )
+    assert await http.get_text("https://api.example.org/x") == "ok"
+    # Header seconds, OpenAlex's JSON retryAfter, then the cap; never shorter than the backoff.
+    assert waits == [12.0, 39.0, 90.0]
+    await http.aclose()
+
+
+async def test_http_client_explains_an_empty_406(tmp_path):
+    http = HttpClient(
+        cache_path=tmp_path / "c.sqlite",
+        transport=httpx.MockTransport(lambda request: httpx.Response(406, text="")),
+    )
+    with pytest.raises(Exception, match="throttling this host"):
+        await http.get_text("https://export.arxiv.org/api/query", {"search_query": "all:memory"})
+    await http.aclose()

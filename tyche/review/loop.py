@@ -3,9 +3,10 @@
 Each round revises only the sections that open findings point at, rebuilds
 and re-gates the paper, and has the panel re-review it (ruling on the prior
 findings). A candidate replaces the current best if it compiles and removes
-gate blockers, or if it compiles, adds no gate blockers, and does not lower
-the composite score by more than the tolerance; otherwise the sections are
-reverted. The loop stops on the target
+gate blockers, or if it compiles, adds no gate blockers, introduces no major
+gate finding the current draft is free of (a dropped limitations paragraph,
+contributions list, or figure reference), and does not lower the composite
+score by more than the tolerance; otherwise the sections are reverted. The loop stops on the target
 score, on a plateau, or on the round limit, and always returns the best
 accepted draft.
 """
@@ -13,6 +14,7 @@ accepted draft.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -32,6 +34,15 @@ class LoopResult:
     best_sections: dict[str, str]
     best_title: str
     rounds: list[dict[str, Any]] = field(default_factory=list)
+
+
+def _major_kinds(build: BuildResult) -> set[tuple[str, str, str]]:
+    """Major gate findings of a build, with counts masked so "812 words" and "700 words" match."""
+    return {
+        (f.gate, f.section, re.sub(r"\d+(?:\.\d+)?", "#", f.message))
+        for f in build.gates.findings
+        if f.severity == "major"
+    }
 
 
 def _as_prompt_finding(entry) -> dict[str, Any]:
@@ -159,7 +170,15 @@ class RevisionLoop:
             writer = self.composer.writer
             writer_state = writer.checkpoint() if hasattr(writer, "checkpoint") else None
             touched_ids: list[str] = []
-            for section, entries in selected.items():
+            if hasattr(writer, "revise_paper"):
+                # An agent author addresses every selected finding in one task, editing the draft in place.
+                findings = [
+                    {**_as_prompt_finding(e), "section": section} for section, entries in selected.items() for e in entries
+                ]
+                responses = await writer.revise_paper(findings)
+                self.ledger.record_responses(responses, round_no)
+                touched_ids = [f["id"] for f in findings]
+            for section, entries in selected.items() if not hasattr(writer, "revise_paper") else ():
                 draft = await self.composer.writer.revise(
                     section,
                     self.composer.ctx,
@@ -182,6 +201,11 @@ class RevisionLoop:
             # unverifiable one, which could never be packaged. Only at equal blocker
             # counts must the candidate also hold the composite score.
             fewer_blockers = candidate.compile.ok and len(candidate.gates.blockers) < len(current.gates.blockers)
+            # A revision may not trade a structural requirement for reviewer points: at equal
+            # blockers, a new major gate finding rejects it before the panel spends a review.
+            regressions = sorted(_major_kinds(candidate) - _major_kinds(current)) if current.compile.ok else []
+            if accepted and regressions and not fewer_blockers:
+                accepted = False
             cand_review = None
             if accepted:
                 cand_review = await self._review(candidate, round_no)
@@ -217,6 +241,7 @@ class RevisionLoop:
                     "delta": delta,
                     "gates_passed": candidate.gates.passed,
                     "blockers": len(candidate.gates.blockers),
+                    "regressions": [f"{gate}/{section}: {message}" for gate, section, message in regressions],
                     "build": candidate.summary(),
                 }
             )

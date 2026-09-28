@@ -395,3 +395,56 @@ async def test_author_conversation_restarts_before_exceeding_the_history_budget(
         await writer.write(name, ctx, {})
     assert max(len(h) for h in llm.histories) < 8  # restarted instead of growing without bound
     assert writer.conversation.tokens() <= 6000 + 2 * 3000
+
+
+def test_main_pages_ignore_review_line_numbers_and_headers():
+    from tyche.paper.latex import main_pages_of
+
+    header = "Under review as a conference paper at ICLR 2027\n\n\n\n"
+    body = header + "268\nthe last lines of the conclusion.\n269\n"
+    # The statement opens page 3; review mode prints a line number before its heading.
+    opens = header + "270\nAI USE STATEMENT\n271\nThis paper was produced with Tyche.\n"
+    assert main_pages_of([body, body, opens, "REFERENCES"]) == 2
+    # When the statement starts mid-page, that page still holds main text.
+    assert main_pages_of([body, body + "AI USE STATEMENT\nText.\n"]) == 2
+    assert main_pages_of([body, body]) == 2
+
+
+async def test_revisions_restate_the_section_requirements(memory, tmp_path):
+    from tyche.llm import ScriptedLLM
+    from tyche.paper.writer import SectionWriter, WritingContext
+    from tyche.planning import ResearchPlan
+    from tyche.selftest import PLAN
+
+    ctx = WritingContext(
+        plan=ResearchPlan.model_validate(PLAN), citations=[], synthesis={}, results_brief="- accuracy 0.70",
+        design_excerpt="design", labels={}, run_id="r1",
+    )
+    reply = {k: (lambda s, u: "<latex>Text. \\paragraph{Limitations.} Small n.</latex>") for k in ("write", "revise", "shorten")}
+    llm = ScriptedLLM(reply)
+    writer = SectionWriter(
+        llm, memory=memory, contracts={}, budget=9000, evidence_limit=4, lessons_limit=2,
+        manifest_dir=tmp_path / "manifests",
+    )
+    draft = (await writer.write("analysis", ctx, {})).latex
+    await writer.revise("analysis", ctx, {}, draft, [{"id": "F1", "problem": "p", "fix": "f"}])
+    # The contract was sent with the first draft only; the revision turn restates its requirements.
+    assert "<section_contract>" not in llm.calls[-1][2] and "\\paragraph{Limitations.}" in llm.calls[-1][2]
+    await writer.shorten("analysis", ctx, draft, 150)
+    assert "\\paragraph{Limitations.}" in llm.calls[-1][2]
+
+
+def test_prose_that_names_pipeline_materials_is_flagged():
+    from tyche.gates.checks import check_internal_terms
+
+    sections = {
+        "analysis": "Failures are rare, and the results brief provides no per-item data for them.",
+        "method": "We follow the research plan. Evidence cards support each claim.",
+        "introduction": "Briefly, results show a clear gain; evidence from cards of prior work is mixed.",
+        "reproducibility": "The run record holds the research plan and the source manifest.",
+    }
+    findings = check_internal_terms(sections)
+    assert sorted((f.section, f.severity) for f in findings) == [
+        ("analysis", "major"), ("method", "major"), ("method", "major")
+    ]
+    assert "results brief" in findings[0].message

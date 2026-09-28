@@ -214,6 +214,7 @@ class Launcher:
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
                 start_new_session=True,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
                 env=os.environ.copy(),
             )
         finally:
@@ -224,7 +225,7 @@ class Launcher:
         """Stop the run and everything it started: experiment scripts may sit in their own sessions."""
         pid = int(process["pid"])
         source = process.get("source", "web")
-        use_group = source == "web" or _is_session_leader(pid)
+        use_group = hasattr(os, "killpg") and (source == "web" or _is_session_leader(pid))
         try:
             root = psutil.Process(pid)
             # Collected before signalling: children re-parent once the run exits.

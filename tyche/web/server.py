@@ -27,7 +27,6 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 from urllib.parse import urlparse
 
-import httpx
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import (
@@ -47,8 +46,11 @@ from tyche.agent.inbox import list_messages, post_message
 from tyche.config import DIRECTIONS, TycheConfig, load_direction
 from tyche.trace import claim_map_for_run, lineage_graph, revision_history
 from tyche.web import runs as web_runs
+from tyche.web import models as web_models
 from tyche.web.processes import Launcher, LauncherProtocol, ProcessRegistry
-from tyche.web.settings import SECRET_KEYS, SettingsError, VALUE_KEYS, apply_env_updates, read_key_presence, read_values
+from tyche.web.settings import (
+    SECRET_KEYS, VALUE_KEYS, SettingsError, apply_env_updates, read_key_presence, read_values, validate_model_updates,
+)
 from tyche.workspace import RUN_ID_PATTERN, read_json, sha256_file
 
 REASONING_LEVELS = ("low", "medium", "high", "xhigh", "max")
@@ -56,8 +58,7 @@ _ENGINES = ("openjiuwen", "imported", "fixture")
 _RUN_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{2,63}")
 # Model identifiers reach the CLI as ``--set`` values, which are YAML-parsed and ``${VAR}``-expanded;
 # anything outside this set could read an environment variable into a logged setting.
-_MODEL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}")
-_BAD_MODEL_WORDS = ("image", "embedding", "tts", "whisper", "audio", "moderation")
+_MODEL_NAME_RE = web_models.MODEL_NAME_RE
 _NOT_BUILT_HTML = """<!doctype html>
 <html><head><meta charset="utf-8"><title>Tyche</title></head>
 <body style="font-family: system-ui, sans-serif; max-width: 40rem; margin: 4rem auto;">
@@ -89,6 +90,7 @@ class AppState:
     host: str
     port: int
     models_cache: dict[str, tuple[float, dict[str, Any]]] = field(default_factory=dict)
+    settings_lock: Any = field(default_factory=threading.RLock)
     _locks: dict[str, threading.Lock] = field(default_factory=dict)
     _locks_guard: threading.Lock = field(default_factory=threading.Lock)
 
@@ -116,9 +118,10 @@ def _reload_env(env_file: Path | None) -> None:
 def build_config(state: AppState) -> TycheConfig:
     """Reload ``.env`` and rebuild the config fresh, so edits (from the settings endpoint or by
     hand) take effect on the next request without restarting the server."""
-    _reload_env(state.env_file)
-    overrides: list[str | dict[str, Any]] = [*state.overrides, {"workspace": {"root": str(state.workspace_root)}}]
-    return TycheConfig.load(state.config_path, overrides)
+    with state.settings_lock:
+        _reload_env(state.env_file)
+        overrides: list[str | dict[str, Any]] = [*state.overrides, {"workspace": {"root": str(state.workspace_root)}}]
+        return TycheConfig.load(state.config_path, overrides)
 
 
 def _require_run_dir(state: AppState, run_id: str) -> Path:
@@ -216,6 +219,13 @@ class PatchRunBody(BaseModel):
 class EnvSettingsBody(BaseModel):
     values: dict[str, str] = {}
     secrets: dict[str, str] = {}
+
+
+class ModelDiscoveryBody(BaseModel):
+    api_base: str | None = None
+    provider: str | None = None
+    api_key: str | None = None
+    refresh: bool = False
 
 
 # -- security middleware ---------------------------------------------------
@@ -327,7 +337,8 @@ def create_app(
 
     @app.exception_handler(RequestValidationError)
     async def _validation_error(request: Request, exc: RequestValidationError):
-        return JSONResponse(status_code=422, content={"error": {"code": "validation_error", "message": str(exc)}})
+        message = "; ".join(f"{'.'.join(map(str, e['loc']))}: {e['msg']}" for e in exc.errors())
+        return JSONResponse(status_code=422, content={"error": {"code": "validation_error", "message": message}})
 
     _register_routes(app, state)
     return app
@@ -374,7 +385,7 @@ def _register_routes(app: FastAPI, state: AppState) -> None:
     def get_meta() -> dict[str, Any]:
         cfg = build_config(state)
         writer = cfg.model("writer")
-        roles = {role: cfg.model(role).public_dict() for role in ("planner", "writer", "reviewer", "experiments", "subject")}
+        roles = {role: cfg.model(role).public_dict() for role in ("default", "planner", "writer", "reviewer", "experiments", "subject")}
         return {
             "version": __version__,
             "workspace": str(state.workspace_root),
@@ -401,17 +412,21 @@ def _register_routes(app: FastAPI, state: AppState) -> None:
             "reasoning_levels": list(REASONING_LEVELS),
         }
 
-    @app.get("/api/models")
-    async def get_models() -> dict[str, Any]:
+    async def discover_models(body: ModelDiscoveryBody) -> dict[str, Any]:
         cfg = build_config(state)
         writer = cfg.model("writer")
-        cache_key = writer.api_base
+        api_base = body.api_base if body.api_base is not None else writer.api_base
+        provider = body.provider if body.provider is not None else writer.provider
+        try:
+            endpoint = web_models.models_endpoint(api_base, provider)
+        except ValueError as exc:
+            raise ApiError(422, "invalid_api_base", str(exc)) from exc
+        if body.api_key is None and api_base.rstrip("/") != writer.api_base.rstrip("/"):
+            raise ApiError(422, "key_required", "Enter an API key for the new endpoint, or save the connection first")
+        api_key = body.api_key if body.api_key is not None else writer.api_key()
+        cache_key = web_models.cache_key(endpoint, provider, api_key)
         now = time.monotonic()
         cached = state.models_cache.get(cache_key)
-        # A model list is kept five minutes; a failed lookup only briefly, so a fixed key shows up soon.
-        if cached is not None and now - cached[0] < (30 if "error" in cached[1] else 300):
-            return cached[1]
-        api_key = writer.api_key()
         fallback = {
             "models": [
                 {
@@ -424,36 +439,25 @@ def _register_routes(app: FastAPI, state: AppState) -> None:
             "source": "config",
             "error": None,
         }
-        result = fallback
+        if not body.refresh and cached is not None and now - cached[0] < (30 if cached[1].get("error") else 300):
+            return {**cached[1], "models": fallback["models"]} if cached[1].get("error") else cached[1]
         try:
-            async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.get(
-                    writer.api_base.rstrip("/") + "/models", headers={"Authorization": f"Bearer {api_key}"}
-                )
-                resp.raise_for_status()
-                data = resp.json()
-            models = []
-            for item in data.get("data") or data.get("models") or []:
-                model_id = item.get("id") or item.get("name")
-                if not model_id or any(bad in model_id.lower() for bad in _BAD_MODEL_WORDS):
-                    continue
-                models.append(
-                    {
-                        "id": model_id,
-                        "context_length": item.get("context_length"),
-                        "max_completion_tokens": item.get("max_completion_tokens"),
-                        "owned_by": item.get("owned_by"),
-                    }
-                )
-            models.sort(key=lambda m: m["id"])
+            models = await web_models.fetch_models(endpoint, provider, api_key)
             result = {"models": models, "source": "endpoint", "error": None}
-        except Exception as exc:  # noqa: BLE001 - report any failure, never the key
-            message = str(exc)
-            if api_key:
-                message = message.replace(api_key, "***")
-            result = {**fallback, "error": f"{type(exc).__name__}: {message}"[:300]}
+        except Exception as exc:  # noqa: BLE001 - discovery must leave manual selection available
+            result = {**fallback, "error": web_models.discovery_error(exc)}
+        if len(state.models_cache) >= 32:
+            state.models_cache.clear()
         state.models_cache[cache_key] = (now, result)
         return result
+
+    @app.get("/api/models")
+    async def get_models(refresh: bool = False) -> dict[str, Any]:
+        return await discover_models(ModelDiscoveryBody(refresh=refresh))
+
+    @app.post("/api/models/discover")
+    async def preview_models(body: ModelDiscoveryBody) -> dict[str, Any]:
+        return await discover_models(body)
 
     # -- runs: list/detail ----------------------------------------------
     @app.get("/api/runs")
@@ -560,11 +564,13 @@ def _register_routes(app: FastAPI, state: AppState) -> None:
 
     @app.get("/api/runs/{run_id}/agents")
     def get_agents(run_id: str) -> dict[str, Any]:
-        return web_runs.agent_sessions(_require_run_dir(state, run_id))
+        return web_runs.agent_sessions(_require_run_dir(state, run_id), live=state.registry.live_process(run_id) is not None)
 
     @app.get("/api/runs/{run_id}/agents/{stage}/{name}")
     def get_agent_transcript(run_id: str, stage: str, name: str) -> dict[str, Any]:
-        transcript = web_runs.agent_transcript(_require_run_dir(state, run_id), stage, name)
+        transcript = web_runs.agent_transcript(
+            _require_run_dir(state, run_id), stage, name, live=state.registry.live_process(run_id) is not None
+        )
         if transcript is None:
             raise ApiError(404, "no_transcript", f"no agent transcript {stage}/{name}")
         return transcript
@@ -608,7 +614,7 @@ def _register_routes(app: FastAPI, state: AppState) -> None:
                     raise ApiError(404, "not_found", "file not found")
                 return FileResponse(file_path, media_type=_guess_media_type(file_path))
             files = [
-                {"path": str(p.relative_to(target)), "size": p.stat().st_size} for p in sorted(target.rglob("*")) if p.is_file()
+                {"path": p.relative_to(target).as_posix(), "size": p.stat().st_size} for p in sorted(target.rglob("*")) if p.is_file()
             ]
             return {"files": files}
         if not target.exists():
@@ -753,16 +759,37 @@ def _register_routes(app: FastAPI, state: AppState) -> None:
 
     @app.put("/api/settings/env")
     def put_settings(body: EnvSettingsBody) -> dict[str, Any]:
+        # Windows cannot replace a dotenv file while another request is reading it.
+        with state.settings_lock:
+            return save_settings(body)
+
+    def save_settings(body: EnvSettingsBody) -> dict[str, Any]:
         unknown_values = set(body.values) - set(VALUE_KEYS)
         unknown_secrets = set(body.secrets) - set(SECRET_KEYS)
         if unknown_values or unknown_secrets:
             raise ApiError(422, "unknown_setting", f"unknown key(s): {sorted(unknown_values | unknown_secrets)}")
         env_path = state.env_file if state.env_file is not None else state.server_cwd / ".env"
         try:
+            validate_model_updates(body.values)
+            _reload_env(state.env_file)
+            candidate = TycheConfig.load(state.config_path, state.overrides, env={**os.environ, **body.values})
+            model_keys = {
+                "MODEL_NAME": "default", "TYCHE_PLANNER_MODEL_NAME": "planner", "TYCHE_WRITER_MODEL_NAME": "writer",
+                "TYCHE_REVIEW_MODEL_NAME": "reviewer", "TYCHE_EXPERIMENT_MODEL_NAME": "experiments",
+                "TYCHE_SUBJECT_MODEL_NAME": "subject",
+            }
+            for key, role in model_keys.items():
+                if key not in body.values:
+                    continue
+                expected = body.values[key] or candidate.model("default").model_name
+                if candidate.model(role).model_name != expected:
+                    raise SettingsError(f"{key} is overridden by the server configuration")
             updates = apply_env_updates(env_path, values=body.values, secrets=body.secrets)
         except SettingsError as exc:
             raise ApiError(422, "invalid_setting", str(exc)) from exc
         os.environ.update(updates)
+        state.env_file = env_path
+        state.models_cache.clear()
         return get_meta()
 
     # -- static frontend + SPA fallback --------------------------------------
@@ -864,6 +891,8 @@ def _create_run_locked(state: AppState, body: RunCreateBody) -> JSONResponse:
         argv += ["--results-dir", str(results_dir)]
     if body.model.model_name:
         argv += ["--set", f"models.default.model_name={json.dumps(body.model.model_name)}"]
+        # The workbench picker names the author model even when a writer override exists.
+        argv += ["--set", f"models.writer.model_name={json.dumps(body.model.model_name)}"]
     if body.model.reasoning_effort is not None:
         extra_body = dict(cfg.get("models.default.extra_body") or {})
         extra_body["reasoning_effort"] = body.model.reasoning_effort

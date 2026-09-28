@@ -69,6 +69,7 @@ export function useAgentTranscript(
   const [tick, setTick] = useState(0);
   const last = useRef(0);
   const timer = useRef<number>();
+  useEffect(() => setData(null), [runId, stage, name]);
   const agentEvents = useMemo(
     () => (events ?? []).filter((e) => e.kind.startsWith("agent.") || e.kind === "operator.delivered").length,
     [events],
@@ -99,7 +100,7 @@ export function useAgentTranscript(
     return () => {
       cancelled = true;
     };
-  }, [runId, stage, name, tick, enabled]);
+  }, [runId, stage, name, tick, enabled, live]);
 
   return data;
 }
@@ -553,12 +554,16 @@ export function AgentStatus({ transcript, session }: { transcript: AgentTranscri
   useTicker(true);
   const waiting = transcript?.waiting_since ?? null;
   const seconds = waiting != null ? Math.max(0, Date.now() / 1000 - waiting) : null;
+  const status = transcript?.status;
+  if (status && status !== "running" && status !== "delegating") {
+    return <div className="text-[13px] text-muted">{sessionLabel(session, t)} · {t(`agents.status.${status}` as MessageKey)}</div>;
+  }
   return (
     <div className="space-y-0.5">
       <div className="flex min-w-0 items-center gap-2 text-[13.5px]">
         <Spark />
         <span key={session} className="flex shrink-0 animate-fade-in items-center text-muted">
-          <span className="shimmer-text font-medium">{t("feed.thinking", { session: sessionLabel(session, t) })}</span>
+          <span className="shimmer-text font-medium">{t(status === "delegating" ? "feed.delegating" : "feed.thinking", { session: sessionLabel(session, t) })}</span>
           <WorkingDots />
         </span>
         {seconds != null && <span className="shrink-0 tabular-nums text-faint">{formatDuration(seconds, t)}</span>}

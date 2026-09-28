@@ -448,7 +448,7 @@ def _relativize(value: Any, run_dir: Path) -> Any:
     if not p.is_absolute():
         return value
     try:
-        return str(p.relative_to(run_dir))
+        return p.relative_to(run_dir).as_posix()
     except ValueError:
         return p.name
 
@@ -694,7 +694,7 @@ def _files_listing(run_dir: Path, attempts: list[Path]) -> tuple[list[dict[str, 
             continue
         if size > 2 * 1024 * 1024:
             continue
-        files.append({"path": str(path.relative_to(code_dir)), "size": size})
+        files.append({"path": path.relative_to(code_dir).as_posix(), "size": size})
         if len(files) >= 500:
             break
     return files, files_root
@@ -817,7 +817,36 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit] + f"\n... ({len(text) - limit} more characters)"
 
 
-def agent_sessions(run_dir: Path) -> dict[str, Any]:
+def _session_details(run_dir: Path, stage: str, rows: list[dict[str, Any]], *, live: bool) -> dict[str, Any]:
+    task_index = next((i for i in range(len(rows) - 1, -1, -1) if rows[i].get("kind") == "task"), 0)
+    task = rows[task_index] if rows else {}
+    current = rows[task_index:]
+    outcome = next((r for r in reversed(current) if r.get("kind") == "outcome"), None)
+    last = rows[-1] if rows else {}
+    if outcome:
+        status = outcome.get("status", "unknown")
+    elif last.get("kind") == "assistant" and not last.get("calls") and not last.get("error"):
+        status = "done"
+    elif last.get("kind") == "result" and last.get("ok") and last.get("tool") in {"submit", "submit_plan"}:
+        status = "done"
+    else:
+        stage_state = read_json(run_dir / "state.json", {}).get("stages", {}).get(stage, {})
+        status = "running" if live and stage_state.get("status") == "running" else "interrupted"
+    if status == "running":
+        waiting = any(r.get("kind") == "assistant" and "delegate" in (r.get("calls") or []) for r in current[-2:])
+        if waiting:
+            status = "delegating"
+    return {
+        "status": status,
+        "model": task.get("model"),
+        "provider": task.get("provider"),
+        "role": task.get("role"),
+        "parent_session": task.get("parent_session"),
+        "last_activity": last.get("at"),
+    }
+
+
+def agent_sessions(run_dir: Path, *, live: bool = False) -> dict[str, Any]:
     """One summary per agent session transcript of a run (plan, write, and review stages)."""
     sessions = []
     for stage in AGENT_STAGES:
@@ -842,12 +871,15 @@ def agent_sessions(run_dir: Path) -> dict[str, Any]:
                     "compactions": sum(1 for r in rows if r.get("kind") == "compact"),
                     "started": rows[0].get("at"),
                     "ended": rows[-1].get("at"),
+                    **_session_details(run_dir, stage, rows, live=live),
                 }
             )
     return {"sessions": sessions}
 
 
-def agent_transcript(run_dir: Path, stage: str, name: str, *, max_text: int = 20000) -> dict[str, Any] | None:
+def agent_transcript(
+    run_dir: Path, stage: str, name: str, *, max_text: int = 20000, live: bool = False
+) -> dict[str, Any] | None:
     """A session's transcript as display items: tasks, the agent's prose with each call and its result,
     operator messages, hand-backs, and compactions. ``waiting_since`` is when the session last sent the
     model a message it has not answered yet (None once it has finished)."""
@@ -864,6 +896,8 @@ def agent_transcript(run_dir: Path, stage: str, name: str, *, max_text: int = 20
     rows = _transcript_rows(path)
     for row in rows:
         kind = row.get("kind")
+        if kind in {"outcome", "turn_start"}:
+            continue
         if kind == "result":
             result = {"ok": bool(row.get("ok")), "text": _clip(row.get("text", ""), max_text)}
             if waiting and waiting[0]["tool"] == row.get("tool"):
@@ -904,8 +938,9 @@ def agent_transcript(run_dir: Path, stage: str, name: str, *, max_text: int = 20
             item["text"] = _clip(row.get("text", ""), max_text)
         items.append(item)
     last = rows[-1] if rows else {}
-    finished = last.get("kind") == "assistant" and not last.get("calls") and not last.get("error")
-    return {"stage": stage, "name": name, "items": items, "waiting_since": None if finished else last.get("at")}
+    details = _session_details(run_dir, stage, rows, live=live)
+    waiting_since = last.get("at") if details["status"] == "running" else None
+    return {"stage": stage, "name": name, "items": items, "waiting_since": waiting_since, **details}
 
 
 def log_tail(workspace_root: Path, run_id: str, *, tail: int = 400) -> dict[str, Any]:

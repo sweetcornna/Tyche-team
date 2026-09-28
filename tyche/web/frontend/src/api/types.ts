@@ -477,7 +477,15 @@ export interface AgentSessionSummary {
   compactions: number;
   started: number;
   ended: number;
+  status: AgentStatus;
+  model: string | null;
+  provider: string | null;
+  role: string | null;
+  parent_session: string | null;
+  last_activity: number | null;
 }
+
+export type AgentStatus = "running" | "delegating" | "done" | "blocked" | "max_turns" | "failed" | "interrupted" | "unknown";
 
 export interface AgentCall {
   tool: string;
@@ -507,6 +515,9 @@ export interface AgentTranscript {
   items: AgentItem[];
   /** When the session last sent the model a message it has not answered (epoch seconds), or null. */
   waiting_since: number | null;
+  status?: AgentStatus;
+  model?: string | null;
+  parent_session?: string | null;
 }
 
 export interface OperatorMessage {

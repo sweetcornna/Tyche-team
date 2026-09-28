@@ -114,10 +114,12 @@ class AgentSession:
         transcript: Path | None = None,
         log: Callable[..., None] | None = None,
         inbox: OperatorInbox | None = None,
+        parent_session: str | None = None,
     ):
         self.llm = llm
         self.inbox = inbox
         self.name = name
+        self.parent_session = parent_session
         self.policy = policy or PermissionPolicy()
         self.hooks = hooks or Hooks()
         self.todos = todos
@@ -277,6 +279,16 @@ class AgentSession:
         return render_operator_messages(messages)
 
     async def run(self, task: str, *, max_turns: int | None = None) -> Outcome:
+        try:
+            outcome = await self._run(task, max_turns=max_turns)
+        except BaseException as exc:
+            self._record("outcome", status="failed" if isinstance(exc, Exception) else "interrupted",
+                         error=type(exc).__name__)
+            raise
+        self._record("outcome", status=outcome.status)
+        return outcome
+
+    async def _run(self, task: str, *, max_turns: int | None = None) -> Outcome:
         """Work on ``task`` in this session's conversation until done or out of turns."""
         self.task = task
         limit = max_turns or self.max_turns
@@ -285,7 +297,10 @@ class AgentSession:
         reminder = self._reminder(limit)
         if reminder:
             message += "\n\n" + reminder
-        self._record("task", text=task)
+        spec = getattr(self.llm, "spec", None)
+        self._record("task", text=task, model=getattr(self.llm, "name", None),
+                     provider=getattr(spec, "provider", None), role=getattr(spec, "role", None),
+                     parent_session=self.parent_session)
         self.log("agent.task", session=self.name, turns=limit)
         stop_blocks = 0
         calls_made = 0
@@ -300,6 +315,7 @@ class AgentSession:
             if self.conversation.tokens() + count_tokens(message) > self.compact_at_tokens and self.conversation.turns:
                 message = await self._compact(message)
             self.log("agent.turn", session=self.name, turn=self.turns_total + 1)
+            self._record("turn_start", turn=self.turns_total + 1)
             reply = await self.conversation.ask(self.llm, message, purpose=f"{self.purpose}:turn")
             self.turns_total += 1
             try:
@@ -392,7 +408,7 @@ def delegate_tool(subagents: list[Subagent], *, log: Callable[..., None] | None 
         answer = outcome.final_text.strip() or "(the helper returned no answer)"
         if outcome.status != "done":
             answer += f"\n(helper stopped: {outcome.status})"
-        return ToolResult(truncate_tokens(answer, helper.max_answer_tokens))
+        return ToolResult(truncate_tokens(answer, helper.max_answer_tokens), ok=outcome.status == "done")
 
     manual = "\n".join(f"- {s.name}: {s.description}" for s in subagents)
     return Tool(

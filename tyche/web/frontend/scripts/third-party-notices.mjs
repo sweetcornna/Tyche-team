@@ -2,14 +2,15 @@
 // production dependency that the built bundle may include. Run after `vite build`.
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join, relative } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const root = new URL("..", import.meta.url).pathname;
-const npm = process.platform === "win32" ? "npm.cmd" : "npm";
-const paths = execFileSync(npm, ["ls", "--omit=dev", "--all", "--parseable"], { cwd: root, encoding: "utf8" })
+const root = fileURLToPath(new URL("..", import.meta.url));
+const npmCli = process.env.npm_execpath ?? (process.platform === "win32" ? join(dirname(process.execPath), "node_modules/npm/bin/npm-cli.js") : undefined);
+const paths = execFileSync(npmCli ? process.execPath : "npm", [...(npmCli ? [npmCli] : []), "ls", "--omit=dev", "--all", "--parseable"], { cwd: root, encoding: "utf8" })
   .split("\n")
   .map((line) => line.trim())
-  .filter((line) => line && line !== root.replace(/\/$/, ""));
+  .filter((line) => line && resolve(line) !== resolve(root));
 
 const seen = new Map();
 for (const dir of paths) {

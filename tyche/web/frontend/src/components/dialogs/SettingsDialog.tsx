@@ -1,14 +1,15 @@
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import clsx from "clsx";
-import { BookMarked, Check, Cpu, FolderCog, Info, Settings2, X, XCircle } from "lucide-react";
+import { BookMarked, Check, Cpu, FolderCog, Info, RefreshCw, Settings2, X, XCircle } from "lucide-react";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { api } from "../../api/client";
-import type { Doctor } from "../../api/types";
+import type { Doctor, ModelsResponse } from "../../api/types";
 import { useI18n, type MessageKey } from "../../lib/i18n";
 import { usePrefs, type Theme } from "../../lib/prefs";
 import { useStore, type SettingsTab } from "../../lib/store";
 import { useToast } from "../../lib/toast";
 import { LogoMark } from "../Logo";
+import { ModelSelect } from "../ModelSelect";
 import { Badge, Button, IconButton, Segmented, Spinner, TextField } from "../ui";
 
 const TABS: { id: SettingsTab; icon: ReactNode; label: MessageKey }[] = [
@@ -26,7 +27,7 @@ export function SettingsDialog() {
     <DialogPrimitive.Root open={settingsOpen} onOpenChange={(v) => !v && closeSettings()}>
       <DialogPrimitive.Portal>
         <DialogPrimitive.Overlay className="fixed inset-0 z-[70] animate-fade-in bg-black/40 dark:bg-black/60" />
-        <DialogPrimitive.Content className="fixed left-1/2 top-1/2 z-[71] flex h-[min(600px,calc(100vh-40px))] w-[calc(100vw-24px)] max-w-[720px] -translate-x-1/2 -translate-y-1/2 animate-pop-in flex-col overflow-hidden rounded-3xl bg-elevated shadow-menu outline-none md:flex-row">
+        <DialogPrimitive.Content className="fixed left-1/2 top-1/2 z-[71] flex h-[min(680px,calc(100vh-40px))] w-[calc(100vw-24px)] max-w-[720px] -translate-x-1/2 -translate-y-1/2 animate-fade-in flex-col overflow-hidden rounded-3xl bg-elevated shadow-menu outline-none md:flex-row">
           <DialogPrimitive.Description className="sr-only">{t("settings.title")}</DialogPrimitive.Description>
           <div className="flex shrink-0 flex-col border-line/[0.08] md:w-[196px] md:border-r md:p-2">
             <div className="flex items-center justify-between px-4 pb-2 pt-4 md:px-2 md:pb-3 md:pt-2">
@@ -73,9 +74,9 @@ function Row({ label, hint, children }: { label: ReactNode; hint?: ReactNode; ch
     <div className="flex flex-col gap-2 border-b border-line/[0.08] py-3.5 last:border-none sm:flex-row sm:items-center sm:justify-between sm:gap-6">
       <div className="min-w-0">
         <div className="text-sm">{label}</div>
-        {hint && <div className="mt-0.5 text-xs leading-5 text-faint">{hint}</div>}
+        {hint && <div className="mt-0.5 break-words text-xs leading-5 text-faint">{hint}</div>}
       </div>
-      <div className="shrink-0 sm:max-w-[60%]">{children}</div>
+      <div className="min-w-0 shrink-0 sm:max-w-[60%]">{children}</div>
     </div>
   );
 }
@@ -115,7 +116,8 @@ function useEnvForm(valueKeys: string[], secretKeys: string[]) {
   const { meta, setMeta } = useStore();
   const toast = useToast();
   const { t } = useI18n();
-  const initial = useMemo(() => Object.fromEntries(valueKeys.map((k) => [k, meta?.env[k] ?? ""])), [meta, valueKeys]);
+  const keyList = valueKeys.join("|");
+  const initial = useMemo(() => Object.fromEntries(keyList.split("|").map((k) => [k, meta?.env[k] ?? ""])), [meta, keyList]);
   const [values, setValues] = useState<Record<string, string>>(initial);
   const [secrets, setSecrets] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
@@ -125,15 +127,17 @@ function useEnvForm(valueKeys: string[], secretKeys: string[]) {
   const changedSecrets = Object.fromEntries(Object.entries(secrets).filter(([k, v]) => secretKeys.includes(k) && v !== ""));
   const dirty = Object.keys(changedValues).length + Object.keys(changedSecrets).length > 0;
 
-  const save = async () => {
+  const save = async (patch: Record<string, string> = {}, quiet = false) => {
     setSaving(true);
     try {
-      const next = await api.saveEnv(changedValues, changedSecrets);
+      const next = await api.saveEnv({ ...changedValues, ...patch }, changedSecrets);
       setMeta(next);
       setSecrets({});
-      toast("success", t("settings.saved"));
+      if (!quiet) toast("success", t("settings.saved"));
+      return true;
     } catch (e) {
       toast("error", t("common.error"), (e as Error).message);
+      return false;
     } finally {
       setSaving(false);
     }
@@ -145,14 +149,13 @@ function KeyField({ name, form, label }: { name: string; form: ReturnType<typeof
   const { t } = useI18n();
   const set = form.meta?.keys[name];
   return (
-    <Row
-      label={label}
-      hint={t("settings.keyHint", { file: form.meta?.env_file ?? ".env" })}
-    >
+    <Row label={label}>
       <div className="flex w-full items-center gap-2 sm:w-[280px]">
         <Badge tone={set ? "ok" : "warn"}>{set ? t("settings.keySet") : t("settings.keyMissing")}</Badge>
         <TextField
           type="password"
+          aria-label={label}
+          disabled={form.saving}
           autoComplete="off"
           spellCheck={false}
           placeholder={t("settings.keyReplace")}
@@ -169,6 +172,8 @@ function ValueField({ name, form, label, placeholder }: { name: string; form: Re
   return (
     <Row label={label}>
       <TextField
+        aria-label={label}
+        disabled={form.saving}
         value={form.values[name] ?? ""}
         placeholder={placeholder}
         spellCheck={false}
@@ -179,23 +184,73 @@ function ValueField({ name, form, label, placeholder }: { name: string; form: Re
   );
 }
 
-const MODEL_VALUES = ["API_BASE", "MODEL_NAME", "MODEL_PROVIDER", "MODEL_CONTEXT_WINDOW", "TYCHE_REVIEW_MODEL_NAME", "TYCHE_EXPERIMENT_MODEL_NAME"];
+const MODEL_VALUES = ["API_BASE", "MODEL_NAME", "MODEL_PROVIDER", "MODEL_CONTEXT_WINDOW", "TYCHE_PLANNER_MODEL_NAME", "TYCHE_WRITER_MODEL_NAME", "TYCHE_REVIEW_MODEL_NAME", "TYCHE_EXPERIMENT_MODEL_NAME", "TYCHE_SUBJECT_MODEL_NAME"];
 const MODEL_SECRETS = ["API_KEY"];
+const MODEL_ROLES = [
+  ["TYCHE_PLANNER_MODEL_NAME", "planner", "settings.plannerModel"],
+  ["TYCHE_WRITER_MODEL_NAME", "writer", "settings.writerModel"],
+  ["TYCHE_REVIEW_MODEL_NAME", "reviewer", "settings.reviewModel"],
+  ["TYCHE_EXPERIMENT_MODEL_NAME", "experiments", "settings.experimentModel"],
+  ["TYCHE_SUBJECT_MODEL_NAME", "subject", "settings.subjectModel"],
+] as const;
 
 function ModelTab() {
   const { t } = useI18n();
   const form = useEnvForm(MODEL_VALUES, MODEL_SECRETS);
+  const { setModel } = usePrefs();
+  const [catalog, setCatalog] = useState<ModelsResponse>();
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string>();
+  const [refresh, setRefresh] = useState(0);
+  const apiBase = form.values.API_BASE || form.meta?.model.api_base || "";
+  const provider = form.values.MODEL_PROVIDER || form.meta?.model.provider || "OpenAI";
+  const key = form.secrets.API_KEY || undefined;
+  useEffect(() => {
+    const controller = new AbortController();
+    setCatalog(undefined);
+    setError(undefined);
+    setLoading(true);
+    const timer = window.setTimeout(() => {
+      api.discoverModels({ api_base: apiBase, provider, api_key: key, refresh: true }, controller.signal)
+        .then((next) => { if (!controller.signal.aborted) { setCatalog(next); setError(next.error ?? undefined); } })
+        .catch((e: Error) => { if (!controller.signal.aborted) setError(e.message); })
+        .finally(() => { if (!controller.signal.aborted) setLoading(false); });
+    }, 600);
+    return () => { window.clearTimeout(timer); controller.abort(); };
+  }, [apiBase, provider, key, refresh]);
+  const apply = async (patch: Record<string, string> = {}) => {
+    if (await form.save(patch, true)) setModel(null);
+  };
+  const defaultModel = form.values.MODEL_NAME || form.meta?.roles.default?.model_name || "";
+  const choices = catalog?.models ?? [];
   return (
-    <div>
+    <div data-testid="settings-model-panel">
       <ValueField name="API_BASE" form={form} label={t("settings.apiBase")} placeholder="https://api.example.com/v1" />
-      <ValueField name="MODEL_NAME" form={form} label={t("settings.modelName")} />
       <ValueField name="MODEL_PROVIDER" form={form} label={t("settings.provider")} placeholder="OpenAI" />
-      <ValueField name="MODEL_CONTEXT_WINDOW" form={form} label={t("settings.contextWindow")} placeholder="131072" />
       <KeyField name="API_KEY" form={form} label={t("settings.apiKey")} />
-      <ValueField name="TYCHE_REVIEW_MODEL_NAME" form={form} label={t("settings.reviewModel")} />
-      <ValueField name="TYCHE_EXPERIMENT_MODEL_NAME" form={form} label={t("settings.experimentModel")} />
+      <div className="flex items-center justify-between gap-2 py-2">
+        <span className="text-xs text-muted" role="status" data-testid="settings-model-catalog-status">
+          {form.saving ? t("model.applying") : loading ? t("common.loading") : catalog?.source === "endpoint" ? t("model.available", { n: choices.length }) : t("model.fromConfig")}
+        </span>
+        <IconButton label={t("model.refresh")} disabled={loading || form.saving} onClick={() => setRefresh((n) => n + 1)}>
+          <RefreshCw className={clsx("h-4 w-4", loading && "animate-spin")} />
+        </IconButton>
+      </div>
+      {error && <p role="alert" className="mb-2 break-words text-xs text-warn">{error}</p>}
+      <Row label={t("settings.modelName")}>
+        <ModelSelect label={t("settings.modelName")} value={defaultModel} models={choices} disabled={form.saving}
+          onChange={(model) => void apply({ MODEL_NAME: model })} />
+      </Row>
+      {MODEL_ROLES.map(([name, role, label]) => (
+        <Row key={name} label={t(label)} hint={form.meta?.roles[role]?.model_name}>
+          <ModelSelect label={t(label)} value={form.values[name] ?? ""} models={choices} inherit={defaultModel}
+            disabled={form.saving} onChange={(model) => void apply({ [name]: model })} />
+        </Row>
+      ))}
+      <ValueField name="MODEL_CONTEXT_WINDOW" form={form} label={t("settings.contextWindow")} placeholder="131072" />
+      <p className="pt-3 text-xs text-muted" role="status">{form.saving ? t("model.applying") : form.dirty ? t("model.pending") : t("model.applied")}</p>
       <div className="flex justify-end pt-4">
-        <Button variant="primary" disabled={!form.dirty} loading={form.saving} onClick={form.save}>
+        <Button variant="primary" disabled={!form.dirty} loading={form.saving} onClick={() => void apply()}>
           {t("settings.save")}
         </Button>
       </div>
@@ -213,7 +268,7 @@ function LiteratureTab() {
       <KeyField name="OPENALEX_API_KEY" form={form} label={t("settings.openalex")} />
       <ValueField name="TYCHE_CONTACT_EMAIL" form={form} label={t("settings.contact")} placeholder="name@example.org" />
       <div className="flex justify-end pt-4">
-        <Button variant="primary" disabled={!form.dirty} loading={form.saving} onClick={form.save}>
+        <Button variant="primary" disabled={!form.dirty} loading={form.saving} onClick={() => void form.save()}>
           {t("settings.save")}
         </Button>
       </div>

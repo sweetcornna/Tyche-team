@@ -30,8 +30,10 @@ models:
     # Optional retention hint for providers that take one (OpenAI
     # prompt_cache_retention, e.g. 24h on models that support it). Empty sends none.
     cache_retention: ""
-  planner: {}
-  writer: {}
+  planner:
+    model_name: ${TYCHE_PLANNER_MODEL_NAME:-}
+  writer:
+    model_name: ${TYCHE_WRITER_MODEL_NAME:-}
   # A different model for reviewing reduces self-agreement bias. Leave empty
   # to reuse the default model.
   reviewer:
@@ -42,7 +44,8 @@ models:
     model_name: ${TYCHE_EXPERIMENT_MODEL_NAME:-}
   # Model the generated experiment code calls as its subject (exported to it as
   # API_KEY/API_BASE/MODEL_NAME). Kept separate because experiments make many calls.
-  subject: {}
+  subject:
+    model_name: ${TYCHE_SUBJECT_MODEL_NAME:-}
 
 workspace:
   # Runs, caches, and the cross-run memory database live here.

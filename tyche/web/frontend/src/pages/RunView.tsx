@@ -27,7 +27,7 @@ import { DIRECTION_ICONS, useAutoGrow } from "../components/Composer";
 import { Header, effortLabel } from "../components/Header";
 import { Markdown } from "../components/Markdown";
 import { RightPanel, PANEL_TABS, type PanelTab } from "../components/panel/RightPanel";
-import { AgentStatus, AgentWork, FEED_SESSION, FeedView, useAgentTranscript } from "../components/run/AgentFeed";
+import { AgentStatus, AgentWork, FEED_SESSION, FeedView, PlanDock, planOf, useAgentTranscript } from "../components/run/AgentFeed";
 import {
   AnalysisContent,
   ExperimentsContent,
@@ -839,6 +839,7 @@ function ControlDock({
     if (!running) setStopping(false);
   }, [running]);
   const operator = useOperatorMessages(detail.run_id, events, running);
+  const plan = useMemo(() => (running ? planOf(liveTranscript) : null), [running, liveTranscript]);
   const queued = operator.messages.filter((m) => m.status === "queued");
   const [steer, setSteer] = useState("");
   const [sending, setSending] = useState(false);
@@ -939,6 +940,7 @@ function ControlDock({
                   ))}
                 </div>
               )}
+              {plan && plan.length > 0 && <PlanDock todos={plan} live />}
               <SteerComposer value={steer} onChange={setSteer} onSend={send} sending={sending} onStop={stop} stopping={stopping} />
             </div>
           ) : (

@@ -51,27 +51,61 @@
 }
 
 @layer components {
-  /* "Thinking…" style shimmering label for work in progress. */
+  /* "Thinking…" style shimmering label for work in progress: a bright band sweeps across muted text. */
   .shimmer-text {
     background: linear-gradient(
-      90deg,
-      rgb(var(--fg-faint)) 0%,
-      rgb(var(--fg-faint)) 35%,
-      rgb(var(--fg)) 50%,
-      rgb(var(--fg-faint)) 65%,
-      rgb(var(--fg-faint)) 100%
+      100deg,
+      rgb(var(--fg-muted)) 0%,
+      rgb(var(--fg-muted)) 38%,
+      rgb(var(--fg)) 48%,
+      rgb(var(--fg)) 52%,
+      rgb(var(--fg-muted)) 62%,
+      rgb(var(--fg-muted)) 100%
     );
-    background-size: 200% 100%;
+    background-size: 250% 100%;
     -webkit-background-clip: text;
     background-clip: text;
     color: transparent;
-    animation: shimmer 2.2s linear infinite;
+    animation: shimmer-sweep 1.8s cubic-bezier(.4, 0, .6, 1) infinite;
+  }
+  @keyframes shimmer-sweep {
+    0% {
+      background-position: 120% 0;
+    }
+    100% {
+      background-position: -20% 0;
+    }
+  }
+  /* A small star that morphs while an agent works (glyphs cycled by the component). */
+  .agent-spark {
+    display: inline-block;
+    width: 1em;
+    text-align: center;
+    color: rgb(var(--info));
+    animation: spark-breathe 2.4s ease-in-out infinite;
+  }
+  @keyframes spark-breathe {
+    0%,
+    100% {
+      transform: scale(1) rotate(0deg);
+      opacity: 1;
+    }
+    50% {
+      transform: scale(1.18) rotate(45deg);
+      opacity: 0.75;
+    }
   }
   @media (prefers-reduced-motion: reduce) {
     .shimmer-text {
       animation: none;
       color: rgb(var(--fg-muted));
       background: none;
+    }
+    .agent-spark,
+    .animate-rise-in,
+    .animate-dot-bounce,
+    .animate-pop-in {
+      animation: none !important;
     }
   }
 

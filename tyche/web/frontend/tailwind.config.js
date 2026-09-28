@@ -46,6 +46,8 @@ export default {
         "pop-in": { from: { opacity: "0", transform: "scale(0.97) translateY(2px)" }, to: { opacity: "1", transform: "none" } },
         "slide-in-right": { from: { transform: "translateX(24px)", opacity: "0" }, to: { transform: "none", opacity: "1" } },
         pulse: { "0%,100%": { opacity: "1" }, "50%": { opacity: ".35" } },
+        "rise-in": { from: { opacity: "0", transform: "translateY(4px)" }, to: { opacity: "1", transform: "none" } },
+        "dot-bounce": { "0%,80%,100%": { opacity: ".25", transform: "translateY(0)" }, "40%": { opacity: "1", transform: "translateY(-2px)" } },
       },
       animation: {
         shimmer: "shimmer 2.2s linear infinite",
@@ -53,6 +55,8 @@ export default {
         "pop-in": "pop-in 140ms cubic-bezier(.2,.8,.2,1)",
         "slide-in-right": "slide-in-right 200ms cubic-bezier(.2,.8,.2,1)",
         "pulse-soft": "pulse 1.6s ease-in-out infinite",
+        "rise-in": "rise-in 220ms cubic-bezier(.2,.8,.2,1)",
+        "dot-bounce": "dot-bounce 1.2s ease-in-out infinite",
       },
     },
   },

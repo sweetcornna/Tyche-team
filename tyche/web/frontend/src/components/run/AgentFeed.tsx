@@ -6,6 +6,7 @@ import {
   Bot,
   Check,
   ChevronRight,
+  ChevronUp,
   Circle,
   FilePen,
   Globe,
@@ -30,6 +31,7 @@ import type { AgentTranscript, RunEvent } from "../../api/types";
 import { formatDuration, humanize } from "../../lib/format";
 import { useTicker } from "../../lib/hooks";
 import { useI18n, type MessageKey } from "../../lib/i18n";
+import { usePersistent } from "../../lib/prefs";
 import { Markdown } from "../Markdown";
 import {
   buildFeed,
@@ -298,7 +300,7 @@ function CallGroup({ calls, defaultOpen }: { calls: CallView[]; defaultOpen: boo
     <div className="rounded-[14px] bg-subtle/[0.035] px-1.5 py-1">
       <button onClick={() => setOpen((v) => !v)} aria-expanded={open} className="flex w-full items-center gap-2 rounded-md px-1.5 py-1 text-left text-[13.5px] text-muted hover:text-fg">
         <Search className="h-[15px] w-[15px] shrink-0 text-faint" />
-        <span className="min-w-0 truncate">{summary.charAt(0).toUpperCase() + summary.slice(1)}</span>
+        <span className={clsx("min-w-0 truncate", defaultOpen && "shimmer-text")}>{summary.charAt(0).toUpperCase() + summary.slice(1)}</span>
         <ChevronRight className={clsx("h-3.5 w-3.5 shrink-0 text-faint transition-transform", open && "rotate-90")} />
         <span className="flex-1" />
         <span className="shrink-0 text-[12px] tabular-nums text-faint">
@@ -345,21 +347,78 @@ export function PlanList({ todos, live = false, compact = false }: { todos: Todo
   );
 }
 
+/** A plan update in the feed: one line with the progress and the current step; the list opens on click. */
 function PlanCell({ todos, live }: { todos: Todo[]; live: boolean }) {
   const { t } = useI18n();
+  const [open, setOpen] = useState(false);
   const done = todos.filter((x) => x.status === "completed").length;
+  const step = todos.find((x) => x.status === "in_progress");
   return (
-    <div className="px-1.5">
-      <div className="mb-1 flex items-center gap-2 text-[13.5px] text-muted">
-        <ListTodo className="h-[15px] w-[15px] text-faint" />
-        {t("feed.plan")}
-        <span className="text-[12px] text-faint">· {t("feed.planProgress", { done, n: todos.length })}</span>
-      </div>
-      <div className="ml-6">
-        <PlanList todos={todos} live={live} compact />
-      </div>
+    <div>
+      <button
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        className="group flex w-full min-w-0 items-center gap-2 rounded-md px-1.5 py-[3px] text-left text-[13.5px] text-muted hover:bg-subtle/[0.05]"
+      >
+        <ListTodo className="h-[15px] w-[15px] shrink-0 text-faint" />
+        <span className="shrink-0">{t("feed.plan")}</span>
+        <span className="shrink-0 text-[12px] tabular-nums text-faint">{t("feed.planProgress", { done, n: todos.length })}</span>
+        {step && !open && <span className="min-w-0 truncate text-[12.5px] text-faint">· {step.content}</span>}
+        <ChevronRight className={clsx("h-3.5 w-3.5 shrink-0 text-faint transition-transform", open && "rotate-90")} />
+      </button>
+      {open && (
+        <div className="mb-1 ml-7 mt-0.5">
+          <PlanList todos={todos} live={live} compact />
+        </div>
+      )}
     </div>
   );
+}
+
+/** The session's current plan, folded above the composer: progress and current step; opens upward on click. */
+export function PlanDock({ todos, live }: { todos: Todo[]; live: boolean }) {
+  const { t } = useI18n();
+  const [open, setOpen] = usePersistent("tyche.planDock", false);
+  const done = todos.filter((x) => x.status === "completed").length;
+  const step = todos.find((x) => x.status === "in_progress") ?? todos.find((x) => x.status === "pending");
+  return (
+    <div className="overflow-hidden rounded-2xl border border-line/10 bg-main">
+      {open && (
+        <div className="max-h-[38vh] overflow-y-auto border-b border-line/[0.07] px-4 py-2.5">
+          <PlanList todos={todos} live={live} compact />
+        </div>
+      )}
+      <button
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        className="flex w-full min-w-0 items-center gap-2 px-4 py-2 text-left text-[13px] hover:bg-subtle/[0.04]"
+      >
+        <ListTodo className="h-4 w-4 shrink-0 text-muted" />
+        <span className="shrink-0 font-medium text-fg">{t("feed.planDock")}</span>
+        <span className="shrink-0 tabular-nums text-faint">
+          {done}/{todos.length}
+        </span>
+        <span className="relative h-1 w-14 shrink-0 overflow-hidden rounded-full bg-subtle/[0.12]">
+          <span
+            className="absolute inset-y-0 left-0 rounded-full bg-ok/70 transition-[width] duration-700 ease-out"
+            style={{ width: `${todos.length ? (done / todos.length) * 100 : 0}%` }}
+          />
+        </span>
+        {step && (
+          <span key={step.id} className="min-w-0 animate-fade-in truncate">
+            <span className={live && step.status === "in_progress" ? "shimmer-text" : "text-muted"}>{step.content}</span>
+          </span>
+        )}
+        <span className="flex-1" />
+        <ChevronUp className={clsx("h-4 w-4 shrink-0 text-faint transition-transform", open && "rotate-180")} />
+      </button>
+    </div>
+  );
+}
+
+/** The latest plan of a transcript, for the plan dock. */
+export function planOf(transcript: AgentTranscript | null): Todo[] | null {
+  return transcript ? latestPlan(buildFeed(transcript.items)) : null;
 }
 
 function Collapsible({ label, icon, tone, children }: { label: ReactNode; icon: ReactNode; tone?: "warn" | "info"; children: ReactNode }) {
@@ -439,13 +498,52 @@ function Block({ block, last, live }: { block: FeedBlock; last: boolean; live: b
 export function FeedView({ transcript, live }: { transcript: AgentTranscript; live: boolean }) {
   const { t } = useI18n();
   const feed = useMemo(() => buildFeed(transcript.items), [transcript.items]);
-  if (!feed.length) return <div className="px-1.5 text-[13.5px] text-faint">{t("feed.waitingFirst")}</div>;
+  // Blocks present at the first render appear at once; later ones rise in as the agent works.
+  const initial = useRef<number | null>(null);
+  if (initial.current === null && feed.length) initial.current = feed.length;
+  if (!feed.length)
+    return (
+      <div className="flex items-center px-1.5 text-[13.5px] text-faint">
+        {t("feed.waitingFirst")}
+        {live && <WorkingDots />}
+      </div>
+    );
   return (
     <div className="space-y-1.5">
       {feed.map((b, i) => (
-        <Block key={i} block={b} last={i === feed.length - 1 || (i === feed.length - 2 && feed[feed.length - 1].type !== "group")} live={live} />
+        <div key={i} className={clsx(live && i >= (initial.current ?? 0) && "animate-rise-in")}>
+          <Block block={b} last={i === feed.length - 1 || (i === feed.length - 2 && feed[feed.length - 1].type !== "group")} live={live} />
+        </div>
       ))}
     </div>
+  );
+}
+
+const SPARK = ["·", "✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳", "✢"];
+
+/** A small star that morphs while an agent works. */
+export function Spark() {
+  const [i, setI] = useState(0);
+  useEffect(() => {
+    if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
+    const id = window.setInterval(() => setI((n) => (n + 1) % SPARK.length), 130);
+    return () => window.clearInterval(id);
+  }, []);
+  return (
+    <span aria-hidden className="agent-spark text-[15px] leading-none">
+      {SPARK[i]}
+    </span>
+  );
+}
+
+/** Three dots that bounce in turn after a working label. */
+export function WorkingDots() {
+  return (
+    <span aria-hidden className="inline-flex translate-y-[1px] items-end gap-[2px] pl-0.5">
+      {[0, 1, 2].map((d) => (
+        <span key={d} className="h-[3px] w-[3px] animate-dot-bounce rounded-full bg-current" style={{ animationDelay: `${d * 160}ms` }} />
+      ))}
+    </span>
   );
 }
 
@@ -454,25 +552,16 @@ export function AgentStatus({ transcript, session }: { transcript: AgentTranscri
   const { t } = useI18n();
   useTicker(true);
   const waiting = transcript?.waiting_since ?? null;
-  const plan = transcript ? latestPlan(buildFeed(transcript.items)) : null;
-  const step = plan?.find((x) => x.status === "in_progress");
-  const done = plan?.filter((x) => x.status === "completed").length ?? 0;
   const seconds = waiting != null ? Math.max(0, Date.now() / 1000 - waiting) : null;
   return (
     <div className="space-y-0.5">
       <div className="flex min-w-0 items-center gap-2 text-[13.5px]">
-        <span className="relative flex h-2 w-2 shrink-0">
-          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-info/50" />
-          <span className="relative inline-flex h-2 w-2 rounded-full bg-info" />
+        <Spark />
+        <span key={session} className="flex shrink-0 animate-fade-in items-center text-muted">
+          <span className="shimmer-text font-medium">{t("feed.thinking", { session: sessionLabel(session, t) })}</span>
+          <WorkingDots />
         </span>
-        <span className="shimmer-text shrink-0 font-medium">{t("feed.thinking", { session: sessionLabel(session, t) })}</span>
         {seconds != null && <span className="shrink-0 tabular-nums text-faint">{formatDuration(seconds, t)}</span>}
-        {plan && plan.length > 0 && (
-          <span className="min-w-0 truncate text-faint">
-            · {done}/{plan.length}
-            {step && ` · ${step.content}`}
-          </span>
-        )}
       </div>
       {seconds != null && seconds > 600 && <div className="pl-4 text-[12px] text-faint">{t("feed.slow")}</div>}
     </div>

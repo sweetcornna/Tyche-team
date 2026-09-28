@@ -62,7 +62,7 @@ Tyche 既能就三个方向**生成论文**（`--direction context_engineering |
 | 路径 | 内容 |
 |---|---|
 | `tyche/` | 全部自研代码：配置、LLM 封装、工作区与溯源、记忆引擎、文献、实验桥接、统计分析、论文写作与编译、门禁、评审、演进、流水线、CLI、离线自检 |
-| `tyche/agent/` | 智能体运行时（工具协议、权限模式、待办清单、结束前检查、子智能体、上下文压缩、回滚、转录）、论文工作台工具与作者智能体 |
+| `tyche/agent/` | 智能体运行时（工具协议、权限模式、待办清单、结束前检查、子智能体、上下文压缩、回滚、操作者插话、转录）、论文工作台工具与作者智能体 |
 | `tyche/trace/` | 可追溯层：论断–证据地图、逐轮修订差异、产物谱系、环境快照、打包目录离线核验 `tyche verify`（均由确定性代码计算，不调用模型） |
 | `tyche/web/` | 科研工作台 `tyche ui`：FastAPI 后端（只监听本机、Host/Origin 校验、SSE 实时推送）与 React 前端 |
 | `tests/tyche/` | 272 个离线单元/端到端测试（含真实 LaTeX 编译的完整自检与 Web API 测试） |
@@ -129,6 +129,8 @@ tyche ui                       # 打开 http://127.0.0.1:8765 ；--port、--work
 
 - **对话式运行视图**：输入研究题目、选择方向与模型推理强度即可开始；每个阶段像一条回复一样展开（计划、文献统计、openJiuwen 实验四个模块的实时进度、结果表与置信区间、写作章节、评审分数曲线与 7 维分数、打包好的论文卡片），附用时与 token 用量；运行中通过 SSE 实时更新，命令行启动的运行也会被识别。
 - **计划审批门**：默认在规划后暂停；可直接批准继续，或在输入框里写下修改意见，Tyche 带着备注重新规划并再次等待审批。
+- **智能体活动流**：规划、写作与评审阶段实时显示智能体的工作，风格参照 Codex：智能体说的话；连续的查询折叠成一组（"读取 2 次、查询数字 4 次"），每行是图标、动作、对象和一行结果（"455 词 · 无问题"），点开看参数与输出；撰写、编辑（显示删改行）、编译、计划更新、检查退回单独成行。底部状态行显示哪个智能体在思考、已用时和当前待办；完成的阶段折叠为"工作了 1 小时 20 分 · 42 次工具调用"。侧边面板"智能体"页可查看每个会话（含事实核查与各位评审）的完整活动流。
+- **运行中插话**：运行时底部就是输入框，可随时给智能体补充要求或信息，不必停止运行；消息先显示为排队，在规划者或作者的下一回合送达后进入活动流。命令行等价命令是 `tyche message --run-id <id> "…"`（不带文本则列出消息与送达情况）。
 - **可控执行**：停止、续跑、从任意阶段重跑（`--from-stage`）、门禁未通过时显式选择 UNVERIFIED 打包。
 - **侧边面板**（可拖拽宽度）：论文 PDF、完整研究计划、文献（证据卡原文）、实验（设计、智能体时间线、生成代码浏览、原始指标、反思）、结果（配对比较）、评审（逐轮分数、评审意见、发现台账、门禁）、**论断–证据地图**、**修订差异**、**产物谱系与环境快照**、运行报告、全部产物版本、日志。
 - **论文库**与**写作经验**页；设置页可修改模型端点与密钥（密钥只写不读，写入被忽略的 `.env`）并运行环境诊断。
@@ -236,7 +238,9 @@ Planning, writing, and review run as agent sessions modelled on coding agents su
 (concepts only): the model acts through deterministic tools under a permission mode, keeps a todo list, gets each
 edit checked at once, cannot finish while the compiled paper fails a gate, delegates fact checks to subagents with a
 fresh context, and has long histories compacted rather than cut. No tool can register a number, add a reference, or
-pass a gate, so the evidence boundary is unchanged.
+pass a gate, so the evidence boundary is unchanged. While a run works, the operator can add requirements from the
+workbench or with `tyche message --run-id ID "..."`; the planner or author receives each message at its next turn,
+and the run record keeps every message and when it was delivered.
 
 A three-lens review panel scores the Stanford Agentic Reviewer's seven dimensions, and a fidelity auditor checks
 claims against the evidence. Their findings drive targeted, acceptance-tested revisions.

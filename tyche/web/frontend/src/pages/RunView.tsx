@@ -22,17 +22,17 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { api, files, type ResumeRequest } from "../api/client";
-import type { RunDetail, RunEvent, StageInfo, StageName } from "../api/types";
+import type { AgentTranscript, OperatorMessage, RunDetail, RunEvent, StageInfo, StageName } from "../api/types";
 import { DIRECTION_ICONS, useAutoGrow } from "../components/Composer";
 import { Header, effortLabel } from "../components/Header";
 import { Markdown } from "../components/Markdown";
 import { RightPanel, PANEL_TABS, type PanelTab } from "../components/panel/RightPanel";
+import { AgentStatus, AgentWork, FEED_SESSION, FeedView, useAgentTranscript } from "../components/run/AgentFeed";
 import {
   AnalysisContent,
   ExperimentsContent,
   PaperCard,
   PlanContent,
-  AgentActivity,
   ReviewContent,
   StageBlock,
   SurveyContent,
@@ -373,6 +373,10 @@ function Conversation({
   const scroller = useRef<HTMLDivElement>(null);
   const [atBottom, setAtBottom] = useState(true);
   const phase = phaseOf(detail);
+  // The agent session the running stage shows (planner or author), shared by its feed and the status line.
+  const liveStage = phase.kind === "running" && phase.stage && FEED_SESSION[phase.stage.name] ? phase.stage.name : undefined;
+  const feedSession = liveStage ? FEED_SESSION[liveStage] : undefined;
+  const liveTranscript = useAgentTranscript(detail.run_id, liveStage, feedSession, { live: !!liveStage, events });
   const visible: ViewStage[] = detail.stages
     .filter((s) => s.status !== "pending")
     .map((s) => (phase.kind === "stopped" && s.status === "running" ? { ...s, interrupted: true } : s));
@@ -385,7 +389,7 @@ function Conversation({
   const toBottom = (smooth = true) => scroller.current?.scrollTo({ top: scroller.current.scrollHeight, behavior: smooth ? "smooth" : "auto" });
 
   // Follow new content while the reader is at the bottom (like a streaming reply).
-  const contentKey = `${visible.map((s) => s.status).join()}|${events.length}|${phase.kind}`;
+  const contentKey = `${visible.map((s) => s.status).join()}|${events.length}|${phase.kind}|${liveTranscript?.items.length ?? 0}`;
   useLayoutEffect(() => {
     if (atBottom) toBottom(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -398,7 +402,15 @@ function Conversation({
           <UserTurn detail={detail} />
           <div className="mt-8 space-y-7">
             {visible.map((stage) => (
-              <StageTurn key={stage.name} stage={stage} detail={detail} events={events} experimentEvents={experimentEvents} onOpen={onOpen} />
+              <StageTurn
+                key={stage.name}
+                stage={stage}
+                detail={detail}
+                events={events}
+                experimentEvents={experimentEvents}
+                onOpen={onOpen}
+                liveTranscript={stage.name === liveStage ? liveTranscript : null}
+              />
             ))}
             <PhaseCard phase={phase} detail={detail} reload={reload} onOpen={onOpen} />
           </div>
@@ -413,7 +425,7 @@ function Conversation({
           <ArrowDown className="h-4 w-4" />
         </button>
       )}
-      <ControlDock detail={detail} phase={phase} reload={reload} />
+      <ControlDock detail={detail} phase={phase} reload={reload} events={events} feedSession={feedSession} liveTranscript={liveTranscript} />
     </div>
   );
 }
@@ -482,12 +494,14 @@ function StageTurn({
   events,
   experimentEvents,
   onOpen,
+  liveTranscript,
 }: {
   stage: ViewStage;
   detail: RunDetail;
   events: RunEvent[];
   experimentEvents: Parameters<typeof ExperimentsContent>[0]["liveEvents"];
   onOpen: (tab: string) => void;
+  liveTranscript: AgentTranscript | null;
 }) {
   const { t } = useI18n();
   const { navigate } = useRouter();
@@ -495,11 +509,18 @@ function StageTurn({
   const running = stage.status === "running" && !stage.interrupted;
   const usage = <UsageDetail detail={detail} stage={stage.name} />;
   const stageEvents = useMemo(() => eventsForStage(events, stage.name), [events, stage.name]);
+  // Running: the session's live feed. Otherwise its work folded into one line that opens the feed.
+  const session = FEED_SESSION[stage.name];
+  const feed = running
+    ? liveTranscript && <FeedView transcript={liveTranscript} live />
+    : session && stage.status !== "pending" && (
+        <AgentWork runId={detail.run_id} stage={stage.name} session={session} seconds={stage.interrupted ? null : stage.duration_s} />
+      );
 
   switch (stage.name) {
     case "plan":
       return (
-        <StageBlock stage={stage} details={withAgents(usage, stageEvents)} live={running ? <AgentActivity events={stageEvents} live /> : undefined}>
+        <StageBlock stage={stage} details={usage} live={feed || undefined}>
           {done && <PlanContent detail={detail} onOpen={onOpen} />}
         </StageBlock>
       );
@@ -531,7 +552,7 @@ function StageTurn({
       );
     case "write":
       return (
-        <StageBlock stage={stage} details={withAgents(usage, stageEvents)} live={running ? <AgentActivity events={stageEvents} live /> : undefined}>
+        <StageBlock stage={stage} details={usage} live={feed || undefined}>
           {(done || stageEvents.some((e) => e.kind === "write.section" || e.kind === "agent.edit")) && <WriteContent stage={stage} events={stageEvents} />}
         </StageBlock>
       );
@@ -539,13 +560,13 @@ function StageTurn({
       return (
         <StageBlock
           stage={stage}
-          details={withAgents(usage, stageEvents)}
+          details={usage}
           live={running ? (
             <div className="space-y-3">
               <ReviewLive events={stageEvents} />
-              <AgentActivity events={stageEvents} live />
+              {feed}
             </div>
-          ) : undefined}
+          ) : feed || undefined}
         >
           {done && <ReviewContent detail={detail} events={stageEvents} onOpen={onOpen} />}
         </StageBlock>
@@ -582,17 +603,6 @@ function StageTurn({
 }
 
 /** Events that belong to the latest attempt of one stage (between its last stage.running and the next stage). */
-/** A finished stage's details: its agents' activity (when it ran agents) above its model usage. */
-function withAgents(usage: ReactNode, events: RunEvent[]): ReactNode {
-  if (!events.some((e) => e.kind === "agent.tool")) return usage;
-  return (
-    <div className="space-y-4">
-      <AgentActivity events={events} />
-      {usage}
-    </div>
-  );
-}
-
 function eventsForStage(events: RunEvent[], stage: StageName): RunEvent[] {
   let start = -1;
   for (let i = events.length - 1; i >= 0; i--) {
@@ -783,7 +793,40 @@ function Card({
 
 /* ---------- Bottom dock: the composer in control mode ---------- */
 
-function ControlDock({ detail, phase, reload }: { detail: RunDetail; phase: Phase; reload: () => void }) {
+/** Operator messages of a run, refreshed when one is delivered or sent. */
+function useOperatorMessages(runId: string, events: RunEvent[], active: boolean) {
+  const [messages, setMessages] = useState<OperatorMessage[]>([]);
+  const delivered = useMemo(() => events.filter((e) => e.kind === "operator.delivered").length, [events]);
+  const [nonce, setNonce] = useState(0);
+  useEffect(() => {
+    if (!active) return;
+    let cancelled = false;
+    api
+      .messages(runId)
+      .then((m) => !cancelled && setMessages(m))
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [runId, delivered, nonce, active]);
+  return { messages, add: (m: OperatorMessage) => setMessages((all) => [...all, m]), refresh: () => setNonce((n) => n + 1) };
+}
+
+function ControlDock({
+  detail,
+  phase,
+  reload,
+  events,
+  feedSession,
+  liveTranscript,
+}: {
+  detail: RunDetail;
+  phase: Phase;
+  reload: () => void;
+  events: RunEvent[];
+  feedSession: string | undefined;
+  liveTranscript: AgentTranscript | null;
+}) {
   const { t } = useI18n();
   const toast = useToast();
   const { confirm, upsertRun } = useStore();
@@ -795,6 +838,24 @@ function ControlDock({ detail, phase, reload }: { detail: RunDetail; phase: Phas
   useEffect(() => {
     if (!running) setStopping(false);
   }, [running]);
+  const operator = useOperatorMessages(detail.run_id, events, running);
+  const queued = operator.messages.filter((m) => m.status === "queued");
+  const [steer, setSteer] = useState("");
+  const [sending, setSending] = useState(false);
+  const send = async () => {
+    const text = steer.trim();
+    if (!text || sending) return;
+    setSending(true);
+    try {
+      operator.add(await api.sendMessage(detail.run_id, text));
+      setSteer("");
+      toast("info", t("steer.sent"));
+    } catch (e) {
+      toast("error", t("common.error"), (e as Error).message);
+    } finally {
+      setSending(false);
+    }
+  };
 
   const stop = async () => {
     const ok = await confirm({ title: t("run.stopConfirm"), body: t("run.stopBody"), confirmLabel: t("run.stop"), destructive: true });
@@ -856,23 +917,39 @@ function ControlDock({ detail, phase, reload }: { detail: RunDetail; phase: Phas
         {phase.kind === "plan-review" ? (
           <PlanNotesComposer value={notes} onChange={setNotes} onSubmit={replan} busy={busy} footer={rerunMenu} />
         ) : (
+          running ? (
+            <div className="space-y-2">
+              <div className="px-3">
+                {feedSession ? (
+                  <AgentStatus transcript={liveTranscript} session={feedSession} />
+                ) : (
+                  <span className="flex min-w-0 items-center gap-2 text-[13.5px]">
+                    <span className="shimmer-text truncate font-medium">{stage ? t(`stageDoing.${stage.name}` as MessageKey) : t("status.running")}</span>
+                    {elapsed != null && <span className="shrink-0 tabular-nums text-faint">{formatDuration(elapsed, t)}</span>}
+                  </span>
+                )}
+              </div>
+              {queued.length > 0 && (
+                <div className="flex flex-col items-end gap-1.5 px-1">
+                  {queued.map((m) => (
+                    <div key={m.id} className="max-w-[85%] rounded-3xl border border-dashed border-line/15 px-4 py-2 text-[14.5px] leading-6 text-muted sm:max-w-[70%]">
+                      <div className="whitespace-pre-wrap break-words">{m.text}</div>
+                      <div className="mt-0.5 text-[11.5px] text-faint">{feedSession ? t("steer.queued") : t("steer.queuedIdle")}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <SteerComposer value={steer} onChange={setSteer} onSend={send} sending={sending} onStop={stop} stopping={stopping} />
+            </div>
+          ) : (
           <div className="flex min-h-[60px] items-center gap-2 rounded-4xl bg-composer py-2.5 pl-5 pr-2.5 shadow-composer dark:shadow-none">
             <div className="min-w-0 flex-1 text-[15px]">
-              {running ? (
-                <span className="flex min-w-0 items-center gap-2">
-                  <span className="shimmer-text truncate font-medium">
-                    {stage ? t(`stageDoing.${stage.name}` as MessageKey) : t("status.running")}
-                  </span>
-                  {elapsed != null && <span className="shrink-0 text-sm tabular-nums text-faint">{formatDuration(elapsed, t)}</span>}
-                </span>
-              ) : (
-                <span className="block truncate text-faint">
-                  {phase.kind === "done" ? t("run.doneControl", { when: relativeTime(detail.updated_at, t) }) : t("composer.followup")}
-                </span>
-              )}
+              <span className="block truncate text-faint">
+                {phase.kind === "done" ? t("run.doneControl", { when: relativeTime(detail.updated_at, t) }) : t("composer.followup")}
+              </span>
             </div>
             {rerunMenu}
-            {!running && phase.kind !== "done" && (
+            {phase.kind !== "done" && (
               <Tooltip content={t("run.resume")}>
                 <button
                   onClick={() => resume({})}
@@ -884,19 +961,8 @@ function ControlDock({ detail, phase, reload }: { detail: RunDetail; phase: Phas
                 </button>
               </Tooltip>
             )}
-            {running && (
-              <Tooltip content={t("run.stop")}>
-                <button
-                  onClick={stop}
-                  disabled={stopping}
-                  aria-label={t("run.stop")}
-                  className="flex h-9 w-9 items-center justify-center rounded-full bg-inverse text-on-inverse transition-opacity hover:opacity-80 disabled:opacity-50"
-                >
-                  <Square className="h-3.5 w-3.5 fill-current" />
-                </button>
-              </Tooltip>
-            )}
           </div>
+          )
         )}
         <p className="px-4 pt-2 text-center text-xs text-faint">{t("home.disclaimer")}</p>
       </div>
@@ -946,6 +1012,72 @@ function PlanNotesComposer({
             onClick={() => canSend && onSubmit()}
             disabled={!canSend}
             aria-label={t("run.replan")}
+            className="flex h-9 w-9 items-center justify-center rounded-full bg-inverse text-on-inverse transition-opacity hover:opacity-80 disabled:bg-subtle/15 disabled:text-main disabled:opacity-100 dark:disabled:bg-subtle/20 dark:disabled:text-[#303030]"
+          >
+            <ArrowUp className="h-5 w-5" strokeWidth={2.2} />
+          </button>
+        </Tooltip>
+      </div>
+    </div>
+  );
+}
+
+/** The composer while a run works: messages to the agents (delivered at their next turn) and Stop. */
+function SteerComposer({
+  value,
+  onChange,
+  onSend,
+  sending,
+  onStop,
+  stopping,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  onSend: () => void;
+  sending: boolean;
+  onStop: () => void;
+  stopping: boolean;
+}) {
+  const { t } = useI18n();
+  const ref = useRef<HTMLTextAreaElement>(null);
+  useAutoGrow(ref, value, 200);
+  const canSend = value.trim().length > 0 && !sending;
+  return (
+    <div className="flex flex-col rounded-4xl bg-composer shadow-composer focus-within:shadow-[0_0_0_1px_rgb(var(--line)/0.16),0_6px_22px_rgb(0_0_0/0.06)] dark:shadow-none">
+      <textarea
+        ref={ref}
+        rows={1}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing && e.keyCode !== 229) {
+            e.preventDefault();
+            if (canSend) onSend();
+          }
+        }}
+        placeholder={t("steer.placeholder")}
+        aria-label={t("steer.placeholder")}
+        maxLength={4000}
+        className="max-h-52 min-h-[52px] w-full resize-none bg-transparent px-5 pb-1 pt-[15px] text-[16px] leading-6 text-fg outline-none placeholder:text-faint"
+      />
+      <div className="flex items-center gap-1.5 px-2.5 pb-2.5 pt-1">
+        <span className="min-w-0 truncate pl-2.5 text-[12px] text-faint">{t("steer.hint")}</span>
+        <div className="flex-1" />
+        <Tooltip content={t("run.stop")}>
+          <button
+            onClick={onStop}
+            disabled={stopping}
+            aria-label={t("run.stop")}
+            className="flex h-9 w-9 items-center justify-center rounded-full border border-line/15 text-fg transition-colors hover:bg-subtle/[0.06] disabled:opacity-50"
+          >
+            <Square className="h-3.5 w-3.5 fill-current" />
+          </button>
+        </Tooltip>
+        <Tooltip content={t("steer.send")}>
+          <button
+            onClick={() => canSend && onSend()}
+            disabled={!canSend}
+            aria-label={t("steer.send")}
             className="flex h-9 w-9 items-center justify-center rounded-full bg-inverse text-on-inverse transition-opacity hover:opacity-80 disabled:bg-subtle/15 disabled:text-main disabled:opacity-100 dark:disabled:bg-subtle/20 dark:disabled:text-[#303030]"
           >
             <ArrowUp className="h-5 w-5" strokeWidth={2.2} />

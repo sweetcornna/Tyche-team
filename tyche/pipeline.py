@@ -17,6 +17,7 @@ from typing import Any
 
 from tyche import STAGES, __version__
 from tyche.agent import AgentAuthor, AgentSettings, Materials, PaperDesk
+from tyche.agent.inbox import DELIVERED, INBOX, OperatorInbox, list_messages
 from tyche.analysis import analyze, build_registry, comparison_table, results_brief, results_figure, results_table
 from tyche.analysis.registry import NumberRegistry
 from tyche.config import TycheConfig
@@ -77,6 +78,8 @@ class Pipeline:
         self.skill_export_dir = skill_export_dir
         self.echo = echo
         self.svc.meter.sink = self.ws.run_dir / "usage.jsonl"
+        # Messages the operator sends while the run works, delivered to the planner and author agents.
+        self.inbox = OperatorInbox(self.ws.run_dir, stage=lambda: self.svc.meter.stage, log=self.log)
 
     # -- helpers -------------------------------------------------------
     def log(self, kind: str, **fields: Any) -> None:
@@ -164,6 +167,7 @@ class Pipeline:
                 max_variants=int(self.cfg.get("experiments.max_variants", 4)),
                 transcript=self._agents_dir("plan", clear=True) / "transcripts" / "planner.jsonl",
                 log=self.log,
+                inbox=self.inbox,
             )
         plan, manifest = await make_plan(
             self.svc.planner,
@@ -414,6 +418,7 @@ class Pipeline:
             "has_intervals": _has_intervals(analysis),
             "has_paired_tests": bool(analysis.get("comparisons")),
             "sources": list(self.cfg.get("literature.sources") or ["arxiv", "semantic_scholar", "openalex"]),
+            "operator_messages": sum(1 for m in list_messages(self.ws.run_dir) if m["status"] == "delivered"),
         }
 
     def _figure_caption(self) -> str:
@@ -456,6 +461,7 @@ class Pipeline:
                 helper_llm=self.svc.reviewer,
                 manifest_dir=self.ws.stage_dir(stage) / "context_manifests",
                 log=self.log,
+                inbox=self.inbox,
             )
         else:
             writer = SectionWriter(
@@ -820,7 +826,7 @@ class Pipeline:
             for extra in list(stage_dir.glob("*.json")):
                 (target / stage).mkdir(parents=True, exist_ok=True)
                 shutil.copy2(extra, target / stage / extra.name)
-        for name in ("state.json", "events.jsonl", "usage.jsonl", "provenance.jsonl", "config.json"):
+        for name in ("state.json", "events.jsonl", "usage.jsonl", "provenance.jsonl", "config.json", INBOX, DELIVERED):
             path = self.ws.run_dir / name
             if path.exists():
                 shutil.copy2(path, target / name)
@@ -841,6 +847,13 @@ class Pipeline:
             f"- Main-text pages: {gates.get('stats', {}).get('main_pages')}",
             f"- Distinct citations: {gates.get('stats', {}).get('distinct_citations')}",
         ]
+        messages = list_messages(self.ws.run_dir)
+        if messages:
+            delivered = sum(1 for m in messages if m["status"] == "delivered")
+            lines.append(
+                f"- Operator messages: {len(messages)} sent, {delivered} delivered to agents "
+                f"(run_record/{INBOX}, run_record/{DELIVERED})"
+            )
         if claims:
             lines.append(
                 f"- Claim-evidence map (claims.json): {claims['claims']} claims, {claims['verified']} verified, "

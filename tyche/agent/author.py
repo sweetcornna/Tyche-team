@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from pydantic import BaseModel, Field
 
 from tyche.agent.desk import Materials, PaperDesk
+from tyche.agent.inbox import OperatorInbox
 from tyche.agent.policy import PermissionPolicy
 from tyche.agent.session import AgentSession, Hooks, Subagent, delegate_tool
 from tyche.agent.todos import Todo, TodoList
@@ -119,8 +120,10 @@ class AgentAuthor:
         helper_llm: "LLMClient | None" = None,
         manifest_dir: Path | None = None,
         log=None,
+        inbox: OperatorInbox | None = None,
     ):
         self.llm = llm
+        self.inbox = inbox
         self.helper_llm = helper_llm or llm
         self.memory = memory
         self.contracts = contracts
@@ -250,6 +253,7 @@ class AgentAuthor:
             state_fn=self.desk.status,
             transcript=self.work_dir / "transcripts" / "author.jsonl",
             log=self.log,
+            inbox=self.inbox,
         )
 
     def _require(self) -> tuple["PaperComposer", PaperDesk, AgentSession]:

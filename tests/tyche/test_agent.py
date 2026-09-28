@@ -444,3 +444,56 @@ async def test_agent_reviewers_check_with_tools_and_fall_back_without_a_report()
     assert out.reviews["rigor"]["overall"] == 6 and out.reviews["clarity"]["overall"] == 5
     assert lookups == ["accuracy"]
     assert ("review.agent_fallback", {"reviewer": "clarity", "status": "done"}) in events
+
+
+# -- operator messages -----------------------------------------------------------------
+
+
+async def test_operator_messages_reach_the_next_turn_and_hold_the_session_open(tmp_path):
+    from tyche.agent.inbox import OperatorInbox, list_messages, post_message
+
+    events = []
+    inbox = OperatorInbox(tmp_path, stage=lambda: "write", log=lambda kind, **f: events.append((kind, f)))
+    tool = Tool("note", "Note.", lambda a: "ok", Note, effect="edit")
+    seen = []
+    replies = iter([call("note", text="a"), "Done.", call("note", text="b"), "Done now."])
+
+    def turn(system, user, history):
+        seen.append(user)
+        if len(seen) == 1:
+            post_message(tmp_path, "Stress the cost trade-off.")  # sent while the first turn is in flight
+        if len(seen) == 2:
+            post_message(tmp_path, "Also mention the ceiling.")  # arrives as the agent is about to finish
+        return next(replies)
+
+    session = _session(ScriptedLLM({"agent:t": turn}), [tool], inbox=inbox, transcript=tmp_path / "t.jsonl")
+    outcome = await session.run("Write.")
+    assert outcome.status == "done" and len(seen) == 4
+    assert "<operator_message" not in seen[0]
+    assert "Stress the cost trade-off." in seen[1] and "numbers still come only from the registered values" in seen[1]
+    # The agent tried to stop with an unread message: it is handed the message instead of ending.
+    assert seen[2].startswith("Before you finish") and "Also mention the ceiling." in seen[2]
+    messages = list_messages(tmp_path)
+    assert [m["status"] for m in messages] == ["delivered", "delivered"]
+    assert [m["delivered"]["session"] for m in messages] == ["t", "t"]
+    assert [m["delivered"]["turn"] for m in messages] == [2, 3]
+    assert [m["delivered"]["stage"] for m in messages] == ["write", "write"]
+    rows = [json.loads(line) for line in (tmp_path / "t.jsonl").read_text().splitlines()]
+    assert [r["text"] for r in rows if r["kind"] == "operator"] == ["Stress the cost trade-off.", "Also mention the ceiling."]
+    assert [k for k, _ in events].count("operator.delivered") == 2
+
+
+def test_operator_messages_are_validated_and_listed(tmp_path):
+    from tyche.agent.inbox import OperatorInbox, list_messages, post_message
+
+    with pytest.raises(ValueError):
+        post_message(tmp_path, "   ")
+    with pytest.raises(ValueError):
+        post_message(tmp_path, "x" * 4001)
+    first = post_message(tmp_path, "  Keep the related work short.  ")
+    assert first["text"] == "Keep the related work short."
+    # A half-written line from a concurrent writer is ignored until it is complete.
+    with (tmp_path / "operator_inbox.jsonl").open("a") as handle:
+        handle.write('{"id": "partial", "text": "unfin')
+    assert [m.id for m in OperatorInbox(tmp_path).pending()] == [first["id"]]
+    assert list_messages(tmp_path)[0]["status"] == "queued"

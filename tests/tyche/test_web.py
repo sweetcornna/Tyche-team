@@ -721,7 +721,11 @@ def test_full_run_detail_paper_and_analysis(tmp_path):
     first = next(i for i in items if i["kind"] == "assistant")
     assert [c["tool"] for c in first["calls"]] == ["update_todos", "write_section"]
     assert first["calls"][1]["args"]["section"] == "method" and "<call" not in first["prose"]
+    # Each call carries its own result, so the UI can show what a read returned or an edit changed.
+    assert first["calls"][1]["result"]["ok"] and first["calls"][1]["result"]["text"].startswith("saved method")
+    assert not any(i["kind"] == "result" for i in items)
     assert any(i["kind"] == "stop_blocked" for i in items)
+    assert client.get("/api/runs/full-run/agents/write/author").json()["waiting_since"] is None
     assert client.get("/api/runs/full-run/agents/write/..%2Fstate").status_code == 404
     assert client.get("/api/runs/full-run/agents/package/author").status_code == 404
 
@@ -904,3 +908,39 @@ def test_readers_wait_for_a_line_that_is_still_being_written(tmp_path):
         handle.write('{"purpose": "plan", "sta')
     client = _client(tmp_path)
     assert client.get("/api/runs/run-live").status_code == 200
+
+
+def test_operator_messages_are_queued_listed_and_validated(tmp_path):
+    Workspace.create(tmp_path, "run-msg", topic="t", direction="memory_engine", config_digest="x")
+    client = _client(tmp_path)
+    assert client.get("/api/runs/run-msg/messages").json() == {"messages": []}
+    posted = client.post("/api/runs/run-msg/messages", json={"text": " Cut the related work to one paragraph. "})
+    assert posted.status_code == 201
+    message = posted.json()["message"]
+    assert message["text"] == "Cut the related work to one paragraph." and message["status"] == "queued"
+    listed = client.get("/api/runs/run-msg/messages").json()["messages"]
+    assert [m["id"] for m in listed] == [message["id"]] and listed[0]["delivered"] is None
+    assert client.post("/api/runs/run-msg/messages", json={"text": "  "}).status_code == 422
+    assert client.post("/api/runs/no-such-run/messages", json={"text": "hi"}).status_code == 404
+
+
+def test_agent_transcript_pairs_results_and_hides_template_markers(tmp_path):
+    ws = Workspace.create(tmp_path, "run-feed", topic="t", direction="memory_engine", config_digest="x")
+    folder = ws.run_dir / "write" / "agents" / "transcripts"
+    folder.mkdir(parents=True)
+    call = '<call tool="read_section"><arg name="section">method</arg></call>'
+    rows = [
+        {"at": 1.0, "kind": "task", "text": "Write."},
+        {"at": 2.0, "kind": "assistant", "turn": 1, "text": "</commentary>Reading first.[/INST]" + call + call},
+        {"at": 2.5, "kind": "result", "turn": 1, "tool": "read_section", "ok": True, "text": "the method section is not written yet"},
+        {"at": 3.0, "kind": "operator", "turn": 2, "text": "Keep it short."},
+    ]
+    (folder / "author.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    body = _client(tmp_path).get("/api/runs/run-feed/agents/write/author").json()
+    turn = body["items"][1]
+    assert turn["prose"] == "Reading first."
+    assert turn["calls"][0]["result"]["text"] == "the method section is not written yet"
+    assert turn["calls"][1]["duplicate_of"] == 1 and turn["calls"][1]["result"] is None
+    assert body["items"][2] == {"kind": "operator", "at": 3.0, "turn": 2, "text": "Keep it short."}
+    # The last row is not a finished reply, so the session is still waiting on the model.
+    assert body["waiting_since"] == 3.0

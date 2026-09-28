@@ -369,3 +369,17 @@ async def test_an_interrupted_draft_resumes_its_agent_session(tmp_path):
     finally:
         await http.aclose()
         memory.close()
+
+
+def test_message_command_queues_and_lists_operator_messages(tmp_path, capsys):
+    import tyche.cli as cli
+    from tyche.workspace import Workspace
+
+    root = tmp_path / "ws"
+    Workspace.create(root, "r1", topic="t", direction="memory_engine", config_digest="x")
+    base = ["message", "--workspace", str(root), "--run-id", "r1"]
+    assert cli.main([*base, "Report the call counts per variant."]) == 0
+    assert "queued message" in capsys.readouterr().out
+    assert cli.main(base) == 0
+    listing = capsys.readouterr().out
+    assert "queued" in listing and "Report the call counts per variant." in listing

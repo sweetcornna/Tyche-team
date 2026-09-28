@@ -1,5 +1,6 @@
 import type {
-  AgentItem,
+  AgentTranscript,
+  OperatorMessage,
   AgentSessionSummary,
   Analysis,
   ArtifactInfo,
@@ -92,7 +93,10 @@ export const api = {
   lineage: (id: string) => request<LineageGraph>(`${run(id)}/lineage`),
   agents: (id: string) => request<{ sessions: AgentSessionSummary[] }>(`${run(id)}/agents`).then((r) => r.sessions),
   agentTranscript: (id: string, stage: string, name: string) =>
-    request<{ stage: string; name: string; items: AgentItem[] }>(`${run(id)}/agents/${enc(stage)}/${enc(name)}`),
+    request<AgentTranscript>(`${run(id)}/agents/${enc(stage)}/${enc(name)}`),
+  messages: (id: string) => request<{ messages: OperatorMessage[] }>(`${run(id)}/messages`).then((r) => r.messages),
+  sendMessage: (id: string, text: string) =>
+    request<{ message: OperatorMessage }>(`${run(id)}/messages`, { method: "POST", body: JSON.stringify({ text }) }).then((r) => r.message),
   environment: (id: string) => request<Record<string, unknown>>(`${run(id)}/environment`),
   create: (body: NewRunRequest) =>
     request<{ run_id: string; process: ProcessInfo }>("/api/runs", { method: "POST", body: JSON.stringify(body) }),

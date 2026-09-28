@@ -216,6 +216,21 @@ def _cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_message(args: argparse.Namespace) -> int:
+    from tyche.agent.inbox import list_messages, post_message
+
+    ws = Workspace.open(_config(args).workspace_root(), args.run_id)
+    if args.text:
+        record = post_message(ws.run_dir, args.text)
+        print(f"[tyche] queued message {record['id']}; it reaches the planner or author at its next turn")
+        return 0
+    for m in list_messages(ws.run_dir):
+        where = m["delivered"] or {}
+        state = f"delivered to {where.get('session')} ({where.get('stage')}, turn {where.get('turn')})" if where else "queued"
+        print(f"{m['at']}  {m['id']}  {state}\n    {m['text']}")
+    return 0
+
+
 async def _cmd_review(args: argparse.Namespace) -> int:
     from tyche.llm import OpenJiuwenLLM, UsageMeter
     from tyche.paper.latex import pdf_text
@@ -425,6 +440,13 @@ def build_parser() -> argparse.ArgumentParser:
     common(status)
     status.add_argument("--run-id")
 
+    message = sub.add_parser(
+        "message", help="send the running agents a message (delivered at their next turn), or list the messages"
+    )
+    common(message)
+    message.add_argument("--run-id", required=True)
+    message.add_argument("text", nargs="?", help="the message; omit it to list the run's messages and their delivery")
+
     verify = sub.add_parser(
         "verify", help="offline check of a packaged paper: hashes, recomputed statistics, numbers, citations, claims"
     )
@@ -469,6 +491,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_status(args)
         if args.command == "verify":
             return _cmd_verify(args)
+        if args.command == "message":
+            return _cmd_message(args)
         if args.command == "review":
             return asyncio.run(_cmd_review(args))
         if args.command == "doctor":

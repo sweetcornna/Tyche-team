@@ -129,6 +129,7 @@ class PlannerAgent:
     transcript: Path | None = None
     log: Any = None
     searches: int = 0
+    inbox: Any = None
 
     async def plan(self, llm: LLMClient, context: str, *, memory: MemoryStore, run_id: str) -> ResearchPlan:
         from tyche.agent.policy import PermissionPolicy
@@ -213,6 +214,7 @@ class PlannerAgent:
             max_turns=self.settings.turns("plan"),
             transcript=self.transcript,
             log=self.log,
+            inbox=self.inbox,
         )
         outcome = await session.run(
             "Make the research plan for the topic in <topic>. When it is ready, call submit_plan with it.\n"

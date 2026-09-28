@@ -796,6 +796,9 @@ def report_text(run_dir: Path) -> str | None:
 
 AGENT_STAGES = ("plan", "write", "review")
 _CALL_BLOCK = re.compile(r"<call\s+(?:tool|name)\s*=\s*[\"'][\w.:-]+[\"']\s*(?:/>|>.*?</call>)", re.S)
+# Chat-template markers some models leak into plain replies (channel tags, instruction brackets);
+# they are dropped from the displayed prose only; the transcript keeps the reply as sent.
+_TEMPLATE_MARKERS = re.compile(r"</?(?:commentary|analysis|final)\b>?|\[/?INST\]|<\|[a-z_]+\|>")
 
 
 def _transcript_rows(path: Path) -> list[dict[str, Any]]:
@@ -845,7 +848,9 @@ def agent_sessions(run_dir: Path) -> dict[str, Any]:
 
 
 def agent_transcript(run_dir: Path, stage: str, name: str, *, max_text: int = 20000) -> dict[str, Any] | None:
-    """A session's transcript as display items: tasks, the agent's prose and calls, results, hand-backs."""
+    """A session's transcript as display items: tasks, the agent's prose with each call and its result,
+    operator messages, hand-backs, and compactions. ``waiting_since`` is when the session last sent the
+    model a message it has not answered yet (None once it has finished)."""
     from tyche.agent.tools import ProtocolError, parse_calls
 
     if stage not in AGENT_STAGES or not re.fullmatch(r"[\w.-]+", name):
@@ -853,9 +858,19 @@ def agent_transcript(run_dir: Path, stage: str, name: str, *, max_text: int = 20
     path = run_dir / stage / "agents" / "transcripts" / f"{name}.jsonl"
     if not path.is_file():
         return None
-    items = []
-    for row in _transcript_rows(path):
+    items: list[dict[str, Any]] = []
+    # Calls of the latest reply still waiting for their result rows, in the order they ran.
+    waiting: list[dict[str, Any]] = []
+    rows = _transcript_rows(path)
+    for row in rows:
         kind = row.get("kind")
+        if kind == "result":
+            result = {"ok": bool(row.get("ok")), "text": _clip(row.get("text", ""), max_text)}
+            if waiting and waiting[0]["tool"] == row.get("tool"):
+                waiting.pop(0)["result"] = result
+                continue
+            items.append({"kind": "result", "at": row.get("at"), "turn": row.get("turn"), "tool": row.get("tool"), **result})
+            continue
         item: dict[str, Any] = {"kind": kind, "at": row.get("at"), "turn": row.get("turn")}
         if kind == "assistant":
             text = row.get("text", "")
@@ -863,13 +878,24 @@ def agent_transcript(run_dir: Path, stage: str, name: str, *, max_text: int = 20
                 calls = parse_calls(text)
             except ProtocolError:
                 calls = []
-            item["prose"] = _clip(_CALL_BLOCK.sub("", text).strip(), max_text)
-            item["calls"] = [
-                {"tool": c.tool, "args": {k: _clip(v, max_text) for k, v in c.raw_args.items()}} for c in calls
-            ]
+            item["prose"] = _clip(_TEMPLATE_MARKERS.sub("", _CALL_BLOCK.sub("", text)).strip(), max_text)
             item["error"] = row.get("error")
-        elif kind == "result":
-            item.update(tool=row.get("tool"), ok=bool(row.get("ok")), text=_clip(row.get("text", ""), max_text))
+            item["calls"] = []
+            seen: dict[str, int] = {}
+            for c in calls:
+                entry: dict[str, Any] = {
+                    "tool": c.tool,
+                    "args": {k: _clip(v, max_text) for k, v in c.raw_args.items()},
+                    "result": None,
+                }
+                key = json.dumps([c.tool, c.raw_args], sort_keys=True)
+                if key in seen:
+                    # The session runs a call repeated within one reply only once.
+                    entry["duplicate_of"] = seen[key]
+                else:
+                    seen[key] = c.index
+                item["calls"].append(entry)
+            waiting = [e for e in item["calls"] if "duplicate_of" not in e]
         elif kind == "stop_blocked":
             item["text"] = _clip(row.get("reason", ""), max_text)
         elif kind == "compact":
@@ -877,7 +903,9 @@ def agent_transcript(run_dir: Path, stage: str, name: str, *, max_text: int = 20
         else:
             item["text"] = _clip(row.get("text", ""), max_text)
         items.append(item)
-    return {"stage": stage, "name": name, "items": items}
+    last = rows[-1] if rows else {}
+    finished = last.get("kind") == "assistant" and not last.get("calls") and not last.get("error")
+    return {"stage": stage, "name": name, "items": items, "waiting_since": None if finished else last.get("at")}
 
 
 def log_tail(workspace_root: Path, run_id: str, *, tail: int = 400) -> dict[str, Any]:

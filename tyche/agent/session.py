@@ -10,6 +10,8 @@ evidence boundary kept in host code:
 * a todo list keeps multi-step work planned and visible;
 * subagents run focused tasks in a fresh context and return only their answer;
 * a long history is compacted into a summary instead of being cut off;
+* the operator can send messages while a session works (``inbox``); each is delivered at
+  the next turn boundary, and a session holding an unread message does not end yet;
 * every turn, call, and result is written to a transcript.
 
 A session is one append-only conversation (see :class:`tyche.llm.Conversation`), so the
@@ -26,6 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from tyche.agent.inbox import OperatorInbox, render as render_operator_messages
 from tyche.agent.policy import PermissionPolicy
 from tyche.agent.todos import Todo, TodoList
 from tyche.agent.tools import (
@@ -110,8 +113,10 @@ class AgentSession:
         state_fn: Callable[[], str] | None = None,
         transcript: Path | None = None,
         log: Callable[..., None] | None = None,
+        inbox: OperatorInbox | None = None,
     ):
         self.llm = llm
+        self.inbox = inbox
         self.name = name
         self.policy = policy or PermissionPolicy()
         self.hooks = hooks or Hooks()
@@ -261,6 +266,16 @@ class AgentSession:
         parts.append("Continue the task.")
         return "\n\n".join(parts)
 
+    def _operator_messages(self, turn: int) -> str:
+        """Messages the operator sent since the last turn, as a block to send with this one."""
+        if self.inbox is None:
+            return ""
+        messages = self.inbox.take(self.name, self.turns_total + 1)
+        if not messages:
+            return ""
+        self._record("operator", turn=turn, ids=[m.id for m in messages], text="\n\n".join(m.text for m in messages))
+        return render_operator_messages(messages)
+
     async def run(self, task: str, *, max_turns: int | None = None) -> Outcome:
         """Work on ``task`` in this session's conversation until done or out of turns."""
         self.task = task
@@ -275,11 +290,16 @@ class AgentSession:
         stop_blocks = 0
         calls_made = 0
         for turn in range(1, limit + 1):
+            # Taken before the hooks, so an autosave of this turn's message includes the operator's.
+            steering = self._operator_messages(turn)
+            if steering:
+                message += "\n\n" + steering
             if turn > 1:
                 for hook in self.hooks.before_turn:
                     await _maybe(hook(self, message))
             if self.conversation.tokens() + count_tokens(message) > self.compact_at_tokens and self.conversation.turns:
                 message = await self._compact(message)
+            self.log("agent.turn", session=self.name, turn=self.turns_total + 1)
             reply = await self.conversation.ask(self.llm, message, purpose=f"{self.purpose}:turn")
             self.turns_total += 1
             try:
@@ -290,6 +310,10 @@ class AgentSession:
                 continue
             self._record("assistant", turn=turn, text=reply.text, calls=[c.tool for c in calls])
             if not calls:
+                if self.inbox is not None and self.inbox.pending():
+                    # A message arrived while the model was answering: it is read before the session ends.
+                    message = "Before you finish, read the operator's message below."
+                    continue
                 reasons = [r for r in [await _maybe(h(self)) for h in self.hooks.on_stop] if r]
                 if not reasons:
                     self.log("agent.done", session=self.name, turns=turn, calls=calls_made)

@@ -43,6 +43,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from tyche import STAGES, __version__
+from tyche.agent.inbox import list_messages, post_message
 from tyche.config import DIRECTIONS, TycheConfig, load_direction
 from tyche.trace import claim_map_for_run, lineage_graph, revision_history
 from tyche.web import runs as web_runs
@@ -200,6 +201,10 @@ class ResumeBody(BaseModel):
     stop_after: str | None = None
     allow_gate_failures: bool = False
     notes: str | None = None
+
+
+class MessageBody(BaseModel):
+    text: str
 
 
 class PatchRunBody(BaseModel):
@@ -563,6 +568,19 @@ def _register_routes(app: FastAPI, state: AppState) -> None:
         if transcript is None:
             raise ApiError(404, "no_transcript", f"no agent transcript {stage}/{name}")
         return transcript
+
+    @app.get("/api/runs/{run_id}/messages")
+    def get_messages(run_id: str) -> dict[str, Any]:
+        return {"messages": list_messages(_require_run_dir(state, run_id))}
+
+    @app.post("/api/runs/{run_id}/messages", status_code=201)
+    def post_run_message(run_id: str, body: MessageBody) -> dict[str, Any]:
+        # Only the inbox file is written, which the pipeline only reads, so no run lock is needed.
+        try:
+            record = post_message(_require_run_dir(state, run_id), body.text)
+        except ValueError as exc:
+            raise ApiError(422, "invalid_message", str(exc)) from exc
+        return {"message": {**record, "status": "queued", "delivered": None}}
 
     @app.get("/api/runs/{run_id}/log")
     def get_log(run_id: str, tail: int = 400) -> dict[str, Any]:

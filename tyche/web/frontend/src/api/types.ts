@@ -479,15 +479,40 @@ export interface AgentSessionSummary {
   ended: number;
 }
 
+export interface AgentCall {
+  tool: string;
+  args: Record<string, string>;
+  /** The call's result; null if it did not run (a session ended by an earlier result tool). */
+  result: { ok: boolean; text: string } | null;
+  /** Set when the reply repeated an earlier call, which the session ran only once. */
+  duplicate_of?: number;
+}
+
 export interface AgentItem {
-  kind: "task" | "assistant" | "result" | "stop_blocked" | "compact";
+  kind: "task" | "assistant" | "result" | "stop_blocked" | "compact" | "operator";
   at?: number;
   turn?: number;
   text?: string;
   prose?: string;
-  calls?: { tool: string; args: Record<string, string> }[];
+  calls?: AgentCall[];
   error?: string | null;
   tool?: string;
   ok?: boolean;
   tokens_before?: number;
+}
+
+export interface AgentTranscript {
+  stage: string;
+  name: string;
+  items: AgentItem[];
+  /** When the session last sent the model a message it has not answered (epoch seconds), or null. */
+  waiting_since: number | null;
+}
+
+export interface OperatorMessage {
+  id: string;
+  at: string;
+  text: string;
+  status: "queued" | "delivered";
+  delivered: { at: number; stage: string; session: string; turn: number } | null;
 }
